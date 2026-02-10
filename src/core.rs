@@ -678,7 +678,10 @@ pub enum ManagerState {
     Clean(PackageManager<Clean>),
     Dirty(PackageManager<Dirty>),
     Planned(PackageManager<Planned>),
-    /// Temporary placeholder during state transitions (never observed externally)
+    /// Temporary placeholder used by `std::mem::take` during state transitions.
+    /// Must never be observed outside a `&mut self` method body.
+    /// SAFETY: Any method that `take`s self must assign `*self` back before
+    /// returning — including on error paths — or accessors will panic.
     #[default]
     Transitioning,
 }
@@ -1233,45 +1236,95 @@ impl ManagerState {
         };
     }
 
-    /// Commit planned changes
+    /// Commit planned changes.
+    ///
+    /// NOTE: We split the take-match-assign into two phases so that a failed
+    /// commit never leaves `*self` as `Transitioning`. The inner commit
+    /// consumes the `PackageManager`, so on error we must reinitialize.
     pub fn commit(&mut self) -> Result<()> {
-        *self = match std::mem::take(self) {
-            ManagerState::Clean(m) => ManagerState::Clean(m),
+        // Phase 1: take ownership and attempt the commit.
+        let taken = std::mem::take(self);
+        let result = match taken {
+            ManagerState::Clean(m) => {
+                *self = ManagerState::Clean(m);
+                return Ok(());
+            }
             ManagerState::Dirty(m) => {
-                // Must plan first
                 let planned = m.plan();
-                let clean = planned.commit()?;
-                ManagerState::Clean(clean)
+                planned.commit()
             }
-            ManagerState::Planned(m) => {
-                let clean = m.commit()?;
-                ManagerState::Clean(clean)
-            }
+            ManagerState::Planned(m) => m.commit(),
             ManagerState::Transitioning => panic!("ManagerState::Transitioning should not be observed"),
         };
-        Ok(())
+        // Phase 2: *self is still Transitioning here — always assign before returning.
+        match result {
+            Ok(clean) => {
+                *self = ManagerState::Clean(clean);
+                Ok(())
+            }
+            Err(e) => {
+                // Inner PackageManager was consumed by the failed commit.
+                // Reinitialize a fresh cache so we don't leave Transitioning.
+                match ManagerState::new() {
+                    Ok(fresh) => *self = fresh,
+                    Err(reinit_err) => {
+                        // Double fault: commit failed AND cache won't reopen.
+                        // *self stays Transitioning — app cannot recover.
+                        return Err(e.wrap_err(format!(
+                            "additionally, failed to reinitialize package cache: {reinit_err}"
+                        )));
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
-    /// Commit planned changes with caller-provided progress implementations
+    /// Commit planned changes with caller-provided progress implementations.
+    ///
+    /// See [`commit`](Self::commit) for the error-recovery rationale.
     pub fn commit_with_progress(
         &mut self,
         acquire_progress: &mut rust_apt::progress::AcquireProgress,
         install_progress: &mut rust_apt::progress::InstallProgress,
     ) -> Result<()> {
-        *self = match std::mem::take(self) {
-            ManagerState::Clean(m) => ManagerState::Clean(m),
+        let taken = std::mem::take(self);
+        let result = match taken {
+            ManagerState::Clean(m) => {
+                *self = ManagerState::Clean(m);
+                return Ok(());
+            }
             ManagerState::Dirty(m) => {
                 let planned = m.plan();
-                let clean = planned.commit_with_progress(acquire_progress, install_progress)?;
-                ManagerState::Clean(clean)
+                planned.commit_with_progress(acquire_progress, install_progress)
             }
             ManagerState::Planned(m) => {
-                let clean = m.commit_with_progress(acquire_progress, install_progress)?;
-                ManagerState::Clean(clean)
+                m.commit_with_progress(acquire_progress, install_progress)
             }
             ManagerState::Transitioning => panic!("ManagerState::Transitioning should not be observed"),
         };
-        Ok(())
+        // *self is still Transitioning here — always assign before returning.
+        match result {
+            Ok(clean) => {
+                *self = ManagerState::Clean(clean);
+                Ok(())
+            }
+            Err(e) => {
+                // Inner PackageManager was consumed by the failed commit.
+                // Reinitialize a fresh cache so we don't leave Transitioning.
+                match ManagerState::new() {
+                    Ok(fresh) => *self = fresh,
+                    Err(reinit_err) => {
+                        // Double fault: commit failed AND cache won't reopen.
+                        // *self stays Transitioning — app cannot recover.
+                        return Err(e.wrap_err(format!(
+                            "additionally, failed to reinitialize package cache: {reinit_err}"
+                        )));
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Run `apt update` with caller-provided progress
