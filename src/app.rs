@@ -20,6 +20,8 @@ pub struct UiState {
     pub multi_select: HashSet<usize>,
     pub selection_anchor: Option<usize>,
     pub visual_mode: bool,
+    /// Visible row count in the package table (set by renderer each frame)
+    pub table_visible_rows: usize,
 }
 
 /// Details pane state and cached data
@@ -90,6 +92,7 @@ impl App {
                 multi_select: HashSet::new(),
                 selection_anchor: None,
                 visual_mode: false,
+                table_visible_rows: 0,
             },
             details: DetailsState::default(),
             modals: ModalState::default(),
@@ -134,6 +137,7 @@ impl App {
         } else {
             None
         });
+        self.center_scroll_offset();
     }
 
     /// Reset UI selection state to beginning
@@ -483,6 +487,7 @@ impl App {
         let current = self.ui.table_state.selected().unwrap_or(0) as i64;
         let new_idx = (current + delta as i64).clamp(0, self.core.package_count() as i64 - 1) as usize;
         self.ui.table_state.select(Some(new_idx));
+        self.center_scroll_offset();
         self.details.scroll = 0;
         self.update_cached_deps();
     }
@@ -492,6 +497,7 @@ impl App {
             return;
         }
         self.ui.table_state.select(Some(0));
+        self.center_scroll_offset();
         self.details.scroll = 0;
         self.update_cached_deps();
     }
@@ -501,8 +507,27 @@ impl App {
             return;
         }
         self.ui.table_state.select(Some(self.core.package_count() - 1));
+        self.center_scroll_offset();
         self.details.scroll = 0;
         self.update_cached_deps();
+    }
+
+    /// Set the table viewport offset so the selected row stays vertically centered.
+    ///
+    /// When the selection is in the top half of the list or the bottom half,
+    /// the highlight moves normally (can't center without content above/below).
+    /// In between, the list scrolls under a pinned highlight at the midpoint.
+    fn center_scroll_offset(&mut self) {
+        let visible = self.ui.table_visible_rows;
+        if visible == 0 {
+            return;
+        }
+        let selected = self.ui.table_state.selected().unwrap_or(0);
+        let total = self.core.package_count();
+        let half = visible / 2;
+        let max_offset = total.saturating_sub(visible);
+        let offset = selected.saturating_sub(half).min(max_offset);
+        *self.ui.table_state.offset_mut() = offset;
     }
 
     pub fn next_details_tab(&mut self) {

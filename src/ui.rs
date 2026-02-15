@@ -333,6 +333,10 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .row_highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("▶ ");
 
+    // Record visible rows so center-scroll logic knows the viewport size.
+    // area.height minus 2 (borders) minus 1 (header row).
+    app.ui.table_visible_rows = area.height.saturating_sub(3) as usize;
+
     frame.render_stateful_widget(table, area, &mut app.ui.table_state);
 
     if !list.is_empty() {
