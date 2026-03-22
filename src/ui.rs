@@ -3,12 +3,13 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, Table, Wrap,
+    ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
 };
 
 use crate::app::App;
 use synh8::types::*;
 
+#[hotpath::measure]
 pub fn ui(frame: &mut Frame, app: &mut App) {
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -258,6 +259,7 @@ fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(legend_widget, chunks[1]);
 }
 
+#[hotpath::measure]
 fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let is_focused = app.ui.focused_pane == FocusedPane::Packages;
     let visible_cols = Column::visible_columns(&app.settings);
@@ -269,11 +271,30 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let header = Row::new(header_cells).height(1);
 
     let list = app.core.list();
-    let rows: Vec<Row> = list
+    let total_count = list.len();
+
+    // Compute visible window — use for both slicing and scroll feedback.
+    // area.height minus 2 (borders) minus 1 (header row).
+    let visible_rows = area.height.saturating_sub(3) as usize;
+    app.ui.table_visible_rows = visible_rows;
+
+    // Read absolute offset from app state (set by center_scroll_offset).
+    // Clamp to handle stale offsets when the list shrinks between frames.
+    let offset = if total_count == 0 {
+        0
+    } else {
+        app.ui.table_state.offset().min(total_count.saturating_sub(1))
+    };
+    let end = (offset + visible_rows).min(total_count);
+    let visible_slice = &list[offset..end];
+
+    // Build rows only for the visible window.
+    let rows: Vec<Row> = visible_slice
         .iter()
         .enumerate()
-        .map(|(idx, pkg)| {
-            let is_multi_selected = app.ui.multi_select.contains(&idx);
+        .map(|(local_idx, pkg)| {
+            let abs_idx = offset + local_idx;
+            let is_multi_selected = app.ui.multi_select.contains(&abs_idx);
             let is_user_marked = app.core.is_user_marked(pkg.id);
 
             let cells: Vec<Cell> = visible_cols
@@ -322,29 +343,38 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
+    // Temporary TableState for the sliced row set: offset = 0, selection
+    // translated to slice-relative index. Never written back to app state.
+    let relative_selected = app.ui.table_state.selected().and_then(|abs| {
+        if abs >= offset && abs < end {
+            Some(abs - offset)
+        } else {
+            None
+        }
+    });
+    let mut temp_table_state = TableState::default();
+    temp_table_state.select(relative_selected);
+
     let table = Table::new(rows, widths)
         .header(header)
         .block(
             Block::default()
-                .title(format!(" Packages ({}) ", list.len()))
+                .title(format!(" Packages ({total_count}) "))
                 .borders(Borders::ALL)
                 .border_style(border_style),
         )
         .row_highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("▶ ");
 
-    // Record visible rows so center-scroll logic knows the viewport size.
-    // area.height minus 2 (borders) minus 1 (header row).
-    app.ui.table_visible_rows = area.height.saturating_sub(3) as usize;
+    frame.render_stateful_widget(table, area, &mut temp_table_state);
 
-    frame.render_stateful_widget(table, area, &mut app.ui.table_state);
-
-    if !list.is_empty() {
+    // Scrollbar uses absolute indices from the original app table state.
+    if total_count > 0 {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("↑"))
             .end_symbol(Some("↓"));
 
-        let mut scrollbar_state = ScrollbarState::new(list.len())
+        let mut scrollbar_state = ScrollbarState::new(total_count)
             .position(app.ui.table_state.selected().unwrap_or(0));
 
         let scrollbar_area = Rect {
