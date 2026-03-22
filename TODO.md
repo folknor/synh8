@@ -16,29 +16,8 @@
 
 - [x] `dup`/`dup2` return values now checked with error propagation
 - [x] FD leak on `StdioRedirect::capture()` error path fixed with OwnedFd guard
-- [ ] `clear_marked()` failure swallowed (`apt.rs:183`) — eprintln goes nowhere during commit
-  (stderr redirected), leaves stale APT marks.
+- [x] `clear_marked()` failure now propagated through `plan()` as error
 - [ ] Interrupted operation — detect and show "Resuming interrupted dpkg operation"
-
-## Dead Code (to remove)
-
-- [x] `PendingChanges` struct — removed
-- [x] `AptPackageState` / `get_apt_status` — removed
-- [x] `PackageManager::set_intent` — removed
-- [x] `PackageManager::get_package_by_id` — removed
-- [x] `ManagerState::is_clean`/`is_dirty`/`is_planned` — removed
-- [x] `ManagerState::plan_errors` — removed
-- [x] `ManagerState::sort_settings` — removed
-- [x] `ManagerState::commit()` non-progress version — removed
-- [x] `ManagerState::mark_remove()` — removed
-- [x] `PackageManager::mark_remove()` (Clean and Dirty) — removed
-- [x] `PackageManager::shared()`/`shared_mut()` — removed (eliminated warnings)
-- [x] `AptCache::commit()` non-progress version — removed
-- [x] `AptCache::count_upgradable()` — removed
-- [x] `PackageManager<Planned>::download_size()`/`install_size_change()`/`has_errors()` — removed
-- [x] `ColumnWidths::reset()` — removed
-- [x] `PhantomData<S>` — removed (redundant with `state: S`)
-- [x] `ModalState::mark_confirm_scroll` — removed
 
 ## Performance
 
@@ -50,28 +29,25 @@
 - [x] Title bar uses `user_mark_count()` instead of iterating full list every frame
 - [x] `update_status_message()` uses `user_mark_count()` instead of list iteration
 - [x] `download_size` uses precomputed accessor instead of re-summing every frame
-- [ ] Filter cache clone copies 81k PackageInfo with 7 Strings each (`core.rs:477`) — every
-  cache-hit rebuild clones the entire list. Consider `Arc` or lazy overlay.
-- [ ] First pass of rebuild_list collects 81k Strings instead of PackageIds (`core.rs:495`) —
-  collecting `PackageId` (4 bytes) instead of String (~30 bytes + heap) would eliminate 81k
-  String allocations on cache miss.
-- [ ] `toggle_mark_impl`/`toggle_unmark` build HashSets from full list (`core.rs:1145`) — could
-  diff `planned_changes()` before vs after instead.
+- [x] First pass of rebuild_list collects `Vec<PackageId>` instead of `Vec<String>`
+- [x] `toggle_mark_impl`/`toggle_unmark` diff `planned_changes()` instead of full-list HashSets
+- [x] `multi_select` replaced with `visual_range: Option<(usize, usize)>` — O(1) membership
+- [x] `visible_columns()` pre-allocates with capacity
+- [ ] Filter cache clone copies 81k PackageInfo with 7 Strings each — every cache-hit
+  rebuild clones the entire list. Consider `Arc` or lazy overlay.
 - [ ] Startup takes ~2s due to pre-warming all 5 filter caches
 - [ ] Changelog fetched synchronously — UI freezes on slow connections
-- [ ] Search results stored as `HashSet<String>` instead of `HashSet<PackageId>` (`core.rs:29`)
-- [ ] `visible_columns()` allocates Vec every frame (`types.rs:391`)
-- [ ] `multi_select` uses HashSet for contiguous range (`app.rs:20`) — a `(start, end)` pair
-  would be O(1)
+- [ ] Search results stored as `HashSet<String>` instead of `HashSet<PackageId>`
 
 ## Refactoring
 
 - [x] `check_apt_lock()` double-call removed — core layer no longer checks, app layer owns it
 - [x] ManagerState dispatch boilerplate — added `shared()`/`shared_mut()` helpers, collapsed ~20
   methods from 4-arm matches to one-liners
-- [ ] `bulk_mark`/`bulk_unmark` duplicate `toggle_current` pattern (`app.rs:507-670`)
 - [x] Three-pane layout deduplicated from 3 copies to 1 with modal overlay
 - [x] 4 scroll methods unified with `clamped_scroll()` helper
+- [x] All dead code removed (18 items — see git history)
+- [ ] `bulk_mark`/`bulk_unmark` duplicate `toggle_current` pattern (`app.rs:507-670`)
 - [ ] `commit_with_progress` error-recovery structure duplicated between ManagerState and
   PackageManager levels
 - [ ] `MarkPreview.additional_upgrades` reused for "also unmarked" — semantic abuse
@@ -87,7 +63,7 @@
 - [x] Keybinding overhaul per KEYBINDINGS-SPEC.md
 - [ ] Scrollbar position indicator in modals
 - [ ] Theming — load colors from config file
-- [ ] Scroll max calculations use magic numbers instead of actual viewport size (`app.rs:839, 845`)
+- [ ] Scroll max calculations use magic numbers instead of actual viewport size
 
 ## Features
 
