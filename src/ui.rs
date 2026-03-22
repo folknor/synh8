@@ -713,21 +713,16 @@ fn render_changelog_view(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_settings_view(frame: &mut Frame, app: &mut App, area: Rect) {
-    let column_items = [
-        ("Status column (S)", app.settings.show_status_column),
-        ("Name column", app.settings.show_name_column),
-        ("Section column", app.settings.show_section_column),
-        ("Installed version column", app.settings.show_installed_version_column),
-        ("Candidate version column", app.settings.show_candidate_version_column),
-        ("Download size column", app.settings.show_download_size_column),
-    ];
+    let all_cols = Column::all();
+    let col_count = all_cols.len();
 
-    let mut items: Vec<ListItem> = column_items
+    let mut items: Vec<ListItem> = all_cols
         .iter()
         .enumerate()
-        .map(|(idx, (label, enabled))| {
-            let checkbox = if *enabled { "[X]" } else { "[ ]" };
-            let text = format!("{checkbox} {label}");
+        .map(|(idx, col)| {
+            let enabled = app.settings.visible_columns.contains(col);
+            let checkbox = if enabled { "[X]" } else { "[ ]" };
+            let text = format!("{checkbox} {}", col.label());
             let style = if idx == app.settings_selection {
                 Style::default().bg(Color::DarkGray)
             } else {
@@ -739,14 +734,14 @@ fn render_settings_view(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Add sort options
     items.push(ListItem::new(""));
-    let sort_style = if app.settings_selection == 6 {
+    let sort_style = if app.settings_selection == col_count {
         Style::default().bg(Color::DarkGray)
     } else {
         Style::default()
     };
     items.push(ListItem::new(format!("Sort by: {}", app.settings.sort_by.label())).style(sort_style));
 
-    let order_style = if app.settings_selection == 7 {
+    let order_style = if app.settings_selection == col_count + 1 {
         Style::default().bg(Color::DarkGray)
     } else {
         Style::default()
@@ -780,87 +775,85 @@ fn render_mark_preview_modal(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut lines = Vec::new();
 
-    if preview.is_marking {
-        // MARK operation
-        let header = if preview.bulk_acted_ids.len() > 1 {
-            format!("Mark {} for install/upgrade?", preview.package_name)
-        } else {
-            let action = if preview.is_upgrade { "upgrade" } else { "install" };
-            format!("Mark '{}' for {}?", preview.package_name, action)
-        };
-        lines.push(Line::from(Span::styled(header, Style::default().bold())));
-        lines.push(Line::from(""));
-
-        if !preview.additional_installs.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("Will install {} additional packages:", preview.additional_installs.len()),
-                Style::default().fg(Color::Green),
-            )));
-            for name in &preview.additional_installs {
-                lines.push(Line::from(format!("  + {name}")));
-            }
+    let title = match preview {
+        MarkPreview::Mark { package_name, is_upgrade, additional_installs, additional_upgrades, additional_removes, download_size, bulk_acted_ids } => {
+            let header = if bulk_acted_ids.len() > 1 {
+                format!("Mark {} for install/upgrade?", package_name)
+            } else {
+                let action = if *is_upgrade { "upgrade" } else { "install" };
+                format!("Mark '{}' for {}?", package_name, action)
+            };
+            lines.push(Line::from(Span::styled(header, Style::default().bold())));
             lines.push(Line::from(""));
-        }
 
-        if !preview.additional_upgrades.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("Will upgrade {} packages:", preview.additional_upgrades.len()),
-                Style::default().fg(Color::Yellow),
-            )));
-            for name in &preview.additional_upgrades {
-                lines.push(Line::from(format!("  ^ {name}")));
+            if !additional_installs.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("Will install {} additional packages:", additional_installs.len()),
+                    Style::default().fg(Color::Green),
+                )));
+                for name in additional_installs {
+                    lines.push(Line::from(format!("  + {name}")));
+                }
+                lines.push(Line::from(""));
             }
+
+            if !additional_upgrades.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("Will upgrade {} packages:", additional_upgrades.len()),
+                    Style::default().fg(Color::Yellow),
+                )));
+                for name in additional_upgrades {
+                    lines.push(Line::from(format!("  ^ {name}")));
+                }
+                lines.push(Line::from(""));
+            }
+
+            if !additional_removes.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("Will remove {} packages:", additional_removes.len()),
+                    Style::default().fg(Color::Red),
+                )));
+                for name in additional_removes {
+                    lines.push(Line::from(format!("  - {name}")));
+                }
+                lines.push(Line::from(""));
+            }
+
+            lines.push(Line::from(Span::styled(
+                format!("Download size: {}", PackageInfo::size_str(*download_size)),
+                Style::default().fg(Color::Cyan),
+            )));
+
+            " Confirm Package Mark "
+        }
+        MarkPreview::Unmark { package_name, also_unmarked, bulk_acted_ids, .. } => {
+            let header = if bulk_acted_ids.len() > 1 {
+                format!("Unmark {}?", package_name)
+            } else {
+                format!("Unmark '{}'?", package_name)
+            };
+            lines.push(Line::from(Span::styled(header, Style::default().bold())));
             lines.push(Line::from(""));
-        }
 
-        if !preview.additional_removes.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("Will remove {} packages:", preview.additional_removes.len()),
-                Style::default().fg(Color::Red),
-            )));
-            for name in &preview.additional_removes {
-                lines.push(Line::from(format!("  - {name}")));
+            if !also_unmarked.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("This will also unmark {} packages:", also_unmarked.len()),
+                    Style::default().fg(Color::Yellow),
+                )));
+                for name in also_unmarked {
+                    lines.push(Line::from(format!("  {name}")));
+                }
             }
-            lines.push(Line::from(""));
-        }
 
-        lines.push(Line::from(Span::styled(
-            format!("Download size: {}", PackageInfo::size_str(preview.download_size)),
-            Style::default().fg(Color::Cyan),
-        )));
-    } else {
-        // UNMARK operation
-        let header = if preview.bulk_acted_ids.len() > 1 {
-            format!("Unmark {}?", preview.package_name)
-        } else {
-            format!("Unmark '{}'?", preview.package_name)
-        };
-        lines.push(Line::from(Span::styled(header, Style::default().bold())));
-        lines.push(Line::from(""));
-
-        // additional_upgrades is repurposed to hold "also unmarked" packages
-        if !preview.additional_upgrades.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("This will also unmark {} packages:", preview.additional_upgrades.len()),
-                Style::default().fg(Color::Yellow),
-            )));
-            for name in &preview.additional_upgrades {
-                lines.push(Line::from(format!("  {name}")));
-            }
+            " Confirm Package Unmark "
         }
-    }
+    };
 
     // Apply scroll offset
     let visible_lines: Vec<Line> = lines
         .into_iter()
         .skip(app.mark_preview_scroll)
         .collect();
-
-    let title = if preview.is_marking {
-        " Confirm Package Mark "
-    } else {
-        " Confirm Package Unmark "
-    };
 
     let modal = Paragraph::new(visible_lines)
         .block(

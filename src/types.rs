@@ -1,5 +1,7 @@
 //! Common types used throughout the application
 
+use std::collections::HashSet;
+
 use ratatui::prelude::*;
 
 // ============================================================================
@@ -281,25 +283,19 @@ impl SortBy {
 /// User settings (not persisted yet)
 #[derive(Debug, Clone)]
 pub struct Settings {
-    pub show_status_column: bool,
-    pub show_name_column: bool,
-    pub show_section_column: bool,
-    pub show_installed_version_column: bool,
-    pub show_candidate_version_column: bool,
-    pub show_download_size_column: bool,
+    pub visible_columns: HashSet<Column>,
     pub sort_by: SortBy,
     pub sort_ascending: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
+        let mut visible_columns = HashSet::new();
+        visible_columns.insert(Column::Status);
+        visible_columns.insert(Column::Name);
+        visible_columns.insert(Column::CandidateVersion);
         Self {
-            show_status_column: true,
-            show_name_column: true,
-            show_section_column: false,
-            show_installed_version_column: false,
-            show_candidate_version_column: true,
-            show_download_size_column: false,
+            visible_columns,
             sort_by: SortBy::CandidateVersion,
             sort_ascending: true,
         }
@@ -325,20 +321,33 @@ pub enum ToggleResult {
     },
 }
 
-/// Additional changes required when marking a single package
-#[derive(Debug, Default, Clone)]
-pub struct MarkPreview {
-    pub package_name: String,
-    pub is_upgrade: bool, // true = package is being upgraded, false = new install
-    pub is_marking: bool, // true = marking for install, false = unmarking
-    pub was_user_marked: bool, // For unmark: was the original package user-marked (vs dependency)?
-    pub additional_installs: Vec<String>,
-    pub additional_upgrades: Vec<String>,
-    pub additional_removes: Vec<String>,
-    pub download_size: u64,
-    /// PackageIds explicitly acted on in a bulk visual-mode operation.
-    /// Empty for single-package toggles. Used by cancel_mark() for reversal.
-    pub bulk_acted_ids: Vec<PackageId>,
+/// Preview of changes when marking or unmarking a package (or bulk selection).
+/// Displayed in a confirmation modal before the action is finalized.
+#[derive(Debug, Clone)]
+pub enum MarkPreview {
+    /// Marking package(s) for install/upgrade
+    Mark {
+        package_name: String,
+        is_upgrade: bool,
+        additional_installs: Vec<String>,
+        additional_upgrades: Vec<String>,
+        additional_removes: Vec<String>,
+        download_size: u64,
+        /// PackageIds explicitly acted on in a bulk visual-mode operation.
+        /// Empty for single-package toggles. Used by cancel_mark() for reversal.
+        bulk_acted_ids: Vec<PackageId>,
+    },
+    /// Unmarking package(s) — reverting a previous mark
+    Unmark {
+        package_name: String,
+        /// Was the original package user-marked (vs a dependency)?
+        was_user_marked: bool,
+        /// Packages that were also unmarked as a cascade effect
+        also_unmarked: Vec<String>,
+        /// PackageIds explicitly acted on in a bulk visual-mode operation.
+        /// Empty for single-package toggles. Used by cancel_mark() for reversal.
+        bulk_acted_ids: Vec<PackageId>,
+    },
 }
 
 /// Column configuration for the package table
@@ -353,6 +362,30 @@ pub enum Column {
 }
 
 impl Column {
+    /// All columns in display order.
+    pub fn all() -> &'static [Column] {
+        &[
+            Self::Status,
+            Self::Name,
+            Self::Section,
+            Self::InstalledVersion,
+            Self::CandidateVersion,
+            Self::DownloadSize,
+        ]
+    }
+
+    /// Human-readable label for the settings UI.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Status => "Status column (S)",
+            Self::Name => "Name column",
+            Self::Section => "Section column",
+            Self::InstalledVersion => "Installed version column",
+            Self::CandidateVersion => "Candidate version column",
+            Self::DownloadSize => "Download size column",
+        }
+    }
+
     pub fn header(&self) -> &'static str {
         match self {
             Self::Status => "S",
@@ -376,26 +409,11 @@ impl Column {
     }
 
     pub fn visible_columns(settings: &Settings) -> Vec<Column> {
-        let mut cols = Vec::with_capacity(6);
-        if settings.show_status_column {
-            cols.push(Self::Status);
-        }
-        if settings.show_name_column {
-            cols.push(Self::Name);
-        }
-        if settings.show_section_column {
-            cols.push(Self::Section);
-        }
-        if settings.show_installed_version_column {
-            cols.push(Self::InstalledVersion);
-        }
-        if settings.show_candidate_version_column {
-            cols.push(Self::CandidateVersion);
-        }
-        if settings.show_download_size_column {
-            cols.push(Self::DownloadSize);
-        }
-        cols
+        Self::all()
+            .iter()
+            .copied()
+            .filter(|col| settings.visible_columns.contains(col))
+            .collect()
     }
 }
 

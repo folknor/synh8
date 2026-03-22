@@ -1278,11 +1278,9 @@ impl ManagerState {
             }
         }
 
-        Some(MarkPreview {
+        Some(MarkPreview::Mark {
             package_name: marked_pkg_name,
             is_upgrade,
-            is_marking: true,
-            was_user_marked: false, // N/A for mark operations (package wasn't marked before)
             additional_installs,
             additional_upgrades,
             additional_removes,

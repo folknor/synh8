@@ -321,15 +321,10 @@ impl App {
                         .filter_map(|id| cache.fullname_of(*id).map(|n| cache.display_name(n).to_string()))
                         .collect();
 
-                    let preview = MarkPreview {
+                    let preview = MarkPreview::Unmark {
                         package_name: pkg_name,
-                        is_upgrade: was_marked,
-                        is_marking: false, // This is an unmark operation
-                        was_user_marked, // Was the original package user-marked (vs dependency)?
-                        additional_installs: Vec::new(),
-                        additional_upgrades: also_names, // Reuse this field for "also unmarked"
-                        additional_removes: Vec::new(),
-                        download_size: 0,
+                        was_user_marked,
+                        also_unmarked: also_names,
                         bulk_acted_ids: Vec::new(),
                     };
                     self.mark_preview = Some(preview);
@@ -371,41 +366,48 @@ impl App {
 
     pub fn cancel_mark(&mut self) {
         if let Some(ref preview) = self.mark_preview {
-            if !preview.bulk_acted_ids.is_empty() {
-                // Bulk cancel: reverse by ID directly
-                if preview.is_marking {
-                    for &id in &preview.bulk_acted_ids {
-                        self.core.unmark(id);
+            match preview {
+                MarkPreview::Mark { package_name, bulk_acted_ids, .. } => {
+                    if !bulk_acted_ids.is_empty() {
+                        // Bulk cancel: reverse by ID directly
+                        for &id in bulk_acted_ids {
+                            self.core.unmark(id);
+                        }
+                        self.core.compute_plan();
+                    } else {
+                        // Single mark cancel: unmark the package
+                        let id_to_unmark = self.resolve_display_name_to_id(package_name);
+                        if let Some(id) = id_to_unmark {
+                            self.core.unmark(id);
+                        }
                     }
-                } else {
-                    for &id in &preview.bulk_acted_ids {
-                        self.core.mark_install(id);
+                }
+                MarkPreview::Unmark { package_name, was_user_marked, also_unmarked, bulk_acted_ids } => {
+                    if !bulk_acted_ids.is_empty() {
+                        // Bulk cancel: re-mark by ID directly
+                        for &id in bulk_acted_ids {
+                            self.core.mark_install(id);
+                        }
+                        self.core.compute_plan();
+                    } else {
+                        // Single unmark cancel: re-mark the USER-MARKED packages only
+                        // Dependencies will be restored automatically by compute_plan()
+                        let names_to_remark: Vec<String> = if *was_user_marked {
+                            vec![package_name.clone()]
+                        } else {
+                            also_unmarked.clone()
+                        };
+
+                        let ids_to_remark: Vec<_> = names_to_remark.iter()
+                            .filter_map(|name| self.resolve_display_name_to_id(name))
+                            .collect();
+
+                        for id in ids_to_remark {
+                            self.core.mark_install(id);
+                        }
+                        self.core.compute_plan();
                     }
                 }
-                self.core.compute_plan();
-            } else if preview.is_marking {
-                // Single mark cancel: unmark the package
-                let id_to_unmark = self.resolve_display_name_to_id(&preview.package_name);
-                if let Some(id) = id_to_unmark {
-                    self.core.unmark(id);
-                }
-            } else {
-                // Single unmark cancel: re-mark the USER-MARKED packages only
-                // Dependencies will be restored automatically by compute_plan()
-                let names_to_remark: Vec<String> = if preview.was_user_marked {
-                    vec![preview.package_name.clone()]
-                } else {
-                    preview.additional_upgrades.clone()
-                };
-
-                let ids_to_remark: Vec<_> = names_to_remark.iter()
-                    .filter_map(|name| self.resolve_display_name_to_id(name))
-                    .collect();
-
-                for id in ids_to_remark {
-                    self.core.mark_install(id);
-                }
-                self.core.compute_plan();
             }
         }
         self.mark_preview = None;
@@ -582,11 +584,9 @@ impl App {
             format!("{} packages", ids_to_mark.len())
         };
 
-        self.mark_preview = Some(MarkPreview {
+        self.mark_preview = Some(MarkPreview::Mark {
             package_name: summary_name,
             is_upgrade: false,
-            is_marking: true,
-            was_user_marked: false,
             additional_installs,
             additional_upgrades,
             additional_removes,
@@ -652,15 +652,10 @@ impl App {
             format!("{} packages", ids_to_unmark.len())
         };
 
-        self.mark_preview = Some(MarkPreview {
+        self.mark_preview = Some(MarkPreview::Unmark {
             package_name: summary_name,
-            is_marking: false,
-            is_upgrade: false,
             was_user_marked: true,
-            additional_installs: Vec::new(),
-            additional_upgrades: cascade_unmarked, // Reuse field for "also unmarked"
-            additional_removes: Vec::new(),
-            download_size: 0,
+            also_unmarked: cascade_unmarked,
             bulk_acted_ids: ids_to_unmark,
         });
         self.mark_preview_scroll = 0;
@@ -787,31 +782,28 @@ impl App {
     }
 
     pub fn toggle_setting(&mut self) {
-        match self.settings_selection {
-            0 => self.settings.show_status_column = !self.settings.show_status_column,
-            1 => self.settings.show_name_column = !self.settings.show_name_column,
-            2 => self.settings.show_section_column = !self.settings.show_section_column,
-            3 => self.settings.show_installed_version_column = !self.settings.show_installed_version_column,
-            4 => self.settings.show_candidate_version_column = !self.settings.show_candidate_version_column,
-            5 => self.settings.show_download_size_column = !self.settings.show_download_size_column,
-            6 => {
-                let all = SortBy::all();
-                let idx = all.iter().position(|&s| s == self.settings.sort_by).unwrap_or(0);
-                self.settings.sort_by = all[(idx + 1) % all.len()];
-                self.core.set_sort(self.settings.sort_by, self.settings.sort_ascending);
-                self.col_widths = self.core.rebuild_list();
+        let all_cols = Column::all();
+        let col_count = all_cols.len();
+        if self.settings_selection < col_count {
+            let col = all_cols[self.settings_selection];
+            if !self.settings.visible_columns.remove(&col) {
+                self.settings.visible_columns.insert(col);
             }
-            7 => {
-                self.settings.sort_ascending = !self.settings.sort_ascending;
-                self.core.set_sort(self.settings.sort_by, self.settings.sort_ascending);
-                self.col_widths = self.core.rebuild_list();
-            }
-            _ => {}
+        } else if self.settings_selection == col_count {
+            let all = SortBy::all();
+            let idx = all.iter().position(|&s| s == self.settings.sort_by).unwrap_or(0);
+            self.settings.sort_by = all[(idx + 1) % all.len()];
+            self.core.set_sort(self.settings.sort_by, self.settings.sort_ascending);
+            self.col_widths = self.core.rebuild_list();
+        } else if self.settings_selection == col_count + 1 {
+            self.settings.sort_ascending = !self.settings.sort_ascending;
+            self.core.set_sort(self.settings.sort_by, self.settings.sort_ascending);
+            self.col_widths = self.core.rebuild_list();
         }
     }
 
     pub fn settings_item_count() -> usize {
-        8
+        Column::all().len() + 2
     }
 
     pub fn show_changes_preview(&mut self) {
@@ -876,20 +868,28 @@ impl App {
     }
 
     pub fn mark_confirm_line_count(&self) -> usize {
-        if let Some(ref preview) = self.mark_preview {
-            let mut count = 2; // Header lines
-            if !preview.additional_installs.is_empty() {
-                count += 1 + preview.additional_installs.len();
+        match self.mark_preview {
+            Some(MarkPreview::Mark { ref additional_installs, ref additional_upgrades, ref additional_removes, .. }) => {
+                let mut count = 2; // Header lines
+                if !additional_installs.is_empty() {
+                    count += 1 + additional_installs.len();
+                }
+                if !additional_upgrades.is_empty() {
+                    count += 1 + additional_upgrades.len();
+                }
+                if !additional_removes.is_empty() {
+                    count += 1 + additional_removes.len();
+                }
+                count + 2 // Footer lines
             }
-            if !preview.additional_upgrades.is_empty() {
-                count += 1 + preview.additional_upgrades.len();
+            Some(MarkPreview::Unmark { ref also_unmarked, .. }) => {
+                let mut count = 2; // Header lines
+                if !also_unmarked.is_empty() {
+                    count += 1 + also_unmarked.len();
+                }
+                count + 2 // Footer lines
             }
-            if !preview.additional_removes.is_empty() {
-                count += 1 + preview.additional_removes.len();
-            }
-            count + 2 // Footer lines
-        } else {
-            0
+            None => 0,
         }
     }
 

@@ -107,6 +107,20 @@ impl Drop for StdioRedirect {
     }
 }
 
+/// Snapshot of progress data passed to the render function.
+pub struct ProgressSnapshot<'a> {
+    pub phase: ProgressPhase,
+    pub percent: f64,
+    pub current_bytes: u64,
+    pub total_bytes: u64,
+    pub speed_bps: u64,
+    pub install_steps_done: u64,
+    pub install_total_steps: u64,
+    pub install_action: &'a str,
+    pub errors: &'a [String],
+    pub title: &'a str,
+}
+
 /// Shared progress state, owned by `Rc<RefCell<_>>`.
 ///
 /// The terminal writes to `/dev/tty` directly, bypassing stdout.
@@ -153,32 +167,21 @@ impl ProgressState {
     }
 
     fn draw(&mut self) {
-        // Borrow fields individually so the closure doesn't capture &mut self
-        let phase = self.phase;
-        let percent = self.percent;
-        let current_bytes = self.current_bytes;
-        let total_bytes = self.total_bytes;
-        let speed_bps = self.speed_bps;
-        let install_steps_done = self.install_steps_done;
-        let install_total_steps = self.install_total_steps;
-        let install_action = &self.install_action;
-        let errors = &self.errors;
-        let title = &self.title;
+        let snap = ProgressSnapshot {
+            phase: self.phase,
+            percent: self.percent,
+            current_bytes: self.current_bytes,
+            total_bytes: self.total_bytes,
+            speed_bps: self.speed_bps,
+            install_steps_done: self.install_steps_done,
+            install_total_steps: self.install_total_steps,
+            install_action: &self.install_action,
+            errors: &self.errors,
+            title: &self.title,
+        };
 
         let _ = self.terminal.draw(|frame| {
-            render_progress_modal(
-                frame,
-                phase,
-                percent,
-                current_bytes,
-                total_bytes,
-                speed_bps,
-                install_steps_done,
-                install_total_steps,
-                install_action,
-                errors,
-                title,
-            );
+            render_progress_modal(frame, &snap);
         });
     }
 }
@@ -283,20 +286,19 @@ impl rust_apt::progress::DynInstallProgress for TuiInstallProgress {
 // Rendering — compact centered modal
 // ============================================================================
 
-#[allow(clippy::too_many_arguments)]
-fn render_progress_modal(
-    frame: &mut Frame,
-    phase: ProgressPhase,
-    percent: f64,
-    current_bytes: u64,
-    total_bytes: u64,
-    speed_bps: u64,
-    install_steps_done: u64,
-    install_total_steps: u64,
-    install_action: &str,
-    errors: &[String],
-    title: &str,
-) {
+fn render_progress_modal(frame: &mut Frame, snap: &ProgressSnapshot) {
+    let &ProgressSnapshot {
+        phase,
+        percent,
+        current_bytes,
+        total_bytes,
+        speed_bps,
+        install_steps_done,
+        install_total_steps,
+        install_action,
+        errors,
+        title,
+    } = snap;
     let area = frame.area();
 
     // Modal size: roomy when no errors, expands to show errors
