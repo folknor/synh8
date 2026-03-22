@@ -110,11 +110,14 @@ impl App {
         // Sync sort settings from UI settings to core
         app.core.set_sort(app.settings.sort_by, app.settings.sort_ascending);
         app.refresh_ui_state();
+        // Pre-warm filter cache so all filter switches are instant
+        app.core.pre_warm_filter_cache();
         app.update_status_message();
         Ok(app)
     }
 
     /// Refresh UI state after core changes, preserving selection by package name
+    #[hotpath::measure]
     fn refresh_ui_state(&mut self) {
         let selected_name = self.selected_package().map(|p| p.name.clone());
         self.col_widths = self.core.rebuild_list();
@@ -123,6 +126,7 @@ impl App {
     }
 
     /// Restore selection by package name, or reset to 0 if not found
+    #[hotpath::measure]
     fn restore_selection(&mut self, package_name: Option<String>) {
         self.ui.multi_select.clear();
         self.ui.selection_anchor = None;
@@ -168,6 +172,7 @@ impl App {
 
     // === Dependency caching (TUI optimization) ===
 
+    #[hotpath::measure]
     pub fn update_cached_deps(&mut self) {
         let pkg_name = self.selected_package()
             .map(|p| p.name.clone())
@@ -230,7 +235,6 @@ impl App {
     // === Filter ===
 
     pub fn apply_current_filter(&mut self) {
-        self.core.apply_filter(self.core.selected_filter());
         self.col_widths = self.core.rebuild_list();
         self.reset_selection();
     }
@@ -245,7 +249,10 @@ impl App {
         let current = self.ui.filter_state.selected().unwrap_or(0) as i32;
         let new_idx = (current + delta).clamp(0, filters.len() as i32 - 1) as usize;
         self.ui.filter_state.select(Some(new_idx));
-        self.core.apply_filter(filters[new_idx]);
+
+        // Set filter and rebuild once. refresh_ui_state() handles rebuild,
+        // selection restore, and dep cache update.
+        self.core.set_filter(filters[new_idx]);
         self.refresh_ui_state();
     }
 

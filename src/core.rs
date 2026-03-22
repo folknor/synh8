@@ -56,6 +56,11 @@ struct SharedState {
     user_intent: HashMap<PackageId, UserIntent>,
     search: SearchState,
     list: Vec<PackageInfo>,
+    /// Per-filter memoization of rebuild_list() results.
+    /// Keyed by FilterCategory only; search/sort are applied in-memory.
+    /// Invalidation: compute_plan() clears MarkedChanges only;
+    /// refresh()/commit() clear all entries.
+    filter_cache: HashMap<FilterCategory, (Vec<PackageInfo>, ColumnWidths)>,
     upgradable_count: usize,
     installed_count: usize,
     total_count: usize,
@@ -70,6 +75,7 @@ impl SharedState {
             user_intent: HashMap::new(),
             search: SearchState::default(),
             list: Vec::new(),
+            filter_cache: HashMap::new(),
             upgradable_count: 0,
             installed_count: 0,
             total_count: 0,
@@ -454,9 +460,28 @@ impl<S: ReadableState> PackageManager<S> {
         self.rebuild_list();
     }
 
-    /// Rebuild the package list based on current filter and search
+    /// Rebuild the package list based on current filter and search.
+    /// Uses per-filter memoization when no search is active to avoid
+    /// expensive FFI re-extraction on repeated filter switches.
+    /// The cache stores lists with BASE statuses only (no user_intent overlay);
+    /// the overlay is applied fresh on every restore so mark changes don't
+    /// require cache invalidation for non-MarkedChanges filters.
     #[hotpath::measure]
     pub fn rebuild_list(&mut self) -> ColumnWidths {
+        let filter = self.shared.selected_filter;
+        let has_search = self.shared.search.results.is_some();
+
+        // Cache hit: clone the cached base list (cache entry stays for reuse).
+        if !has_search {
+            if let Some((cached_list, col_widths)) = self.shared.filter_cache.get(&filter) {
+                self.shared.list = cached_list.clone();
+                let col_widths = col_widths.clone();
+                Self::apply_user_intent_overlay(&mut self.shared.list, &self.shared.user_intent);
+                self.sort_list();
+                return col_widths;
+            }
+        }
+
         self.shared.list.clear();
 
         let sort = if self.shared.selected_filter == FilterCategory::Upgradable {
@@ -467,7 +492,6 @@ impl<S: ReadableState> PackageManager<S> {
 
         // First pass: collect package full names that match filters
         // (avoids borrow conflict between cache iteration and extract_package_info)
-        // Use full names to properly handle multi-arch packages
         let matching_fullnames: Vec<String> = {
             let search_results = &self.shared.search.results;
             let user_intent = &self.shared.user_intent;
@@ -490,7 +514,6 @@ impl<S: ReadableState> PackageManager<S> {
                         FilterCategory::All => true,
                     };
 
-                    // Search matches base name for user convenience
                     let matches_search = match search_results {
                         Some(results) => results.contains(pkg.name()),
                         None => true,
@@ -502,29 +525,14 @@ impl<S: ReadableState> PackageManager<S> {
                 .collect()
         };
 
-        // Second pass: extract full package info
+        // Second pass: extract full package info (base statuses only)
         for fullname in matching_fullnames {
-            if let Some(mut info) = self.shared.cache.extract_package_info_by_name(&fullname) {
-                // Update status based on user intent
-                if let Some(&intent) = self.shared.user_intent.get(&info.id) {
-                    info.status = match intent {
-                        UserIntent::Install => {
-                            if info.status == PackageStatus::Upgradable {
-                                PackageStatus::MarkedForUpgrade
-                            } else {
-                                PackageStatus::MarkedForInstall
-                            }
-                        }
-                        UserIntent::Remove => PackageStatus::MarkedForRemove,
-                        UserIntent::Hold => PackageStatus::Keep,
-                        UserIntent::Default => info.status,
-                    };
-                }
+            if let Some(info) = self.shared.cache.extract_package_info_by_name(&fullname) {
                 self.shared.list.push(info);
             }
         }
 
-        // Calculate column widths (use display name length, not full name)
+        // Calculate column widths from base data
         let mut col_widths = ColumnWidths::new();
         for pkg in &self.shared.list {
             let display_len = self.shared.cache.display_name(&pkg.name).len() as u16;
@@ -534,8 +542,38 @@ impl<S: ReadableState> PackageManager<S> {
             col_widths.candidate = col_widths.candidate.max(pkg.candidate_version.len() as u16);
         }
 
+        // Cache the base list (before user_intent overlay) for future switches
+        if !has_search {
+            self.shared.filter_cache.insert(filter, (self.shared.list.clone(), col_widths.clone()));
+        }
+
+        // Apply user_intent overlay after caching base data
+        Self::apply_user_intent_overlay(&mut self.shared.list, &self.shared.user_intent);
+
         self.sort_list();
         col_widths
+    }
+
+    /// Apply user_intent status overlay to a package list.
+    /// Converts base statuses (Installed/Upgradable/NotInstalled) to marked
+    /// statuses (MarkedForUpgrade/MarkedForInstall/etc) for packages in user_intent.
+    fn apply_user_intent_overlay(list: &mut [PackageInfo], user_intent: &HashMap<PackageId, UserIntent>) {
+        for info in list.iter_mut() {
+            if let Some(&intent) = user_intent.get(&info.id) {
+                info.status = match intent {
+                    UserIntent::Install => {
+                        if info.status == PackageStatus::Upgradable {
+                            PackageStatus::MarkedForUpgrade
+                        } else {
+                            PackageStatus::MarkedForInstall
+                        }
+                    }
+                    UserIntent::Remove => PackageStatus::MarkedForRemove,
+                    UserIntent::Hold => PackageStatus::Keep,
+                    UserIntent::Default => info.status,
+                };
+            }
+        }
     }
 
     /// Sort the package list
@@ -641,6 +679,7 @@ impl<S: ReadableState> PackageManager<S> {
 
         self.shared.cache.refresh().map_err(|e| e.to_string())?;
         self.shared.user_intent.clear();
+        self.shared.filter_cache.clear();
         self.shared.search.index = None;
         self.shared.search.query.clear();
         self.shared.search.results = None;
@@ -856,6 +895,17 @@ impl ManagerState {
         }
     }
 
+    /// Set the filter category without rebuilding the list.
+    /// Caller is responsible for calling rebuild_list() afterwards.
+    pub fn set_filter(&mut self, filter: FilterCategory) {
+        match self {
+            ManagerState::Clean(m) => m.shared.selected_filter = filter,
+            ManagerState::Dirty(m) => m.shared.selected_filter = filter,
+            ManagerState::Planned(m) => m.shared.selected_filter = filter,
+            ManagerState::Transitioning => panic!("Transitioning state observed"),
+        }
+    }
+
     pub fn rebuild_list(&mut self) -> ColumnWidths {
         match self {
             ManagerState::Clean(m) => m.rebuild_list(),
@@ -868,6 +918,23 @@ impl ManagerState {
             }
             ManagerState::Transitioning => panic!("Transitioning state observed"),
         }
+    }
+
+    /// Pre-warm the filter cache by building the list for all filters.
+    /// Called once at startup so subsequent filter switches are instant.
+    /// Restores the original filter afterwards.
+    pub fn pre_warm_filter_cache(&mut self) {
+        let original_filter = self.selected_filter();
+        for &filter in FilterCategory::all() {
+            if filter == original_filter {
+                continue; // Already built by initial refresh_ui_state
+            }
+            self.set_filter(filter);
+            self.rebuild_list();
+        }
+        // Restore original filter and rebuild
+        self.set_filter(original_filter);
+        self.rebuild_list();
     }
 
     pub fn set_sort(&mut self, sort_by: SortBy, ascending: bool) {
@@ -1231,10 +1298,31 @@ impl ManagerState {
     pub fn compute_plan(&mut self) {
         *self = match std::mem::take(self) {
             ManagerState::Clean(m) => ManagerState::Clean(m), // No marks, stay clean
-            ManagerState::Dirty(m) => ManagerState::Planned(m.plan()),
+            ManagerState::Dirty(m) => {
+                let planned = m.plan();
+                ManagerState::Planned(planned)
+            }
             ManagerState::Planned(m) => ManagerState::Planned(m), // Already planned
             ManagerState::Transitioning => panic!("ManagerState::Transitioning should not be observed"),
         };
+        // Marks changed — invalidate MarkedChanges cache only.
+        // Other filters (Installed/Upgradable/etc) are unaffected by marks.
+        self.invalidate_filter_cache(Some(FilterCategory::MarkedChanges));
+    }
+
+    /// Invalidate per-filter memoization cache.
+    /// None = clear all entries; Some(filter) = clear only that filter.
+    fn invalidate_filter_cache(&mut self, filter: Option<FilterCategory>) {
+        let shared = match self {
+            ManagerState::Clean(m) => &mut m.shared,
+            ManagerState::Dirty(m) => &mut m.shared,
+            ManagerState::Planned(m) => &mut m.shared,
+            ManagerState::Transitioning => return,
+        };
+        match filter {
+            Some(f) => { shared.filter_cache.remove(&f); }
+            None => shared.filter_cache.clear(),
+        }
     }
 
     /// Commit planned changes.

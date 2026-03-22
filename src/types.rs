@@ -148,7 +148,7 @@ impl PackageStatus {
 }
 
 /// Filter categories (left panel)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FilterCategory {
     Upgradable,
     MarkedChanges,
