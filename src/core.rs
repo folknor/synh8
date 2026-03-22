@@ -136,14 +136,6 @@ impl PackageManager<Clean> {
         }
     }
 
-    /// Mark a package for removal, transitioning to Dirty
-    pub fn mark_remove(mut self, id: PackageId) -> PackageManager<Dirty> {
-        self.shared.user_intent.insert(id, UserIntent::Remove);
-        PackageManager {
-            shared: self.shared,
-            state: Dirty,
-        }
-    }
 }
 
 // Dirty state - has user marks, no computed plan
@@ -151,12 +143,6 @@ impl PackageManager<Dirty> {
     /// Mark a package for install/upgrade
     pub fn mark_install(mut self, id: PackageId) -> Self {
         self.shared.user_intent.insert(id, UserIntent::Install);
-        self
-    }
-
-    /// Mark a package for removal
-    pub fn mark_remove(mut self, id: PackageId) -> Self {
-        self.shared.user_intent.insert(id, UserIntent::Remove);
         self
     }
 
@@ -351,16 +337,6 @@ impl PackageManager<Planned> {
 // ============================================================================
 
 impl<S: ReadableState> PackageManager<S> {
-    /// Get the shared state (read-only for most things)
-    pub fn shared(&self) -> &SharedState {
-        &self.shared
-    }
-
-    /// Get mutable access to shared state
-    pub fn shared_mut(&mut self) -> &mut SharedState {
-        &mut self.shared
-    }
-
     /// Get a package by index in current list
     pub fn get_package(&self, index: usize) -> Option<&PackageInfo> {
         self.shared.list.get(index)
