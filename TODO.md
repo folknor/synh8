@@ -47,14 +47,13 @@
 - [x] Three-pane layout deduplicated from 3 copies to 1 with modal overlay
 - [x] 4 scroll methods unified with `clamped_scroll()` helper
 - [x] All dead code removed (18 items — see git history)
+- [x] `MarkPreview` refactored from struct-with-bool to proper `Mark`/`Unmark` enum
+- [x] `Settings` column visibility refactored from 6 bools to `HashSet<Column>`
+- [x] Progress rendering refactored from 11 args to `ProgressSnapshot` struct
 - [ ] `bulk_mark`/`bulk_unmark` duplicate `toggle_current` pattern (`app.rs:507-670`)
 - [ ] `commit_with_progress` error-recovery structure duplicated between ManagerState and
   PackageManager levels
-- [ ] `MarkPreview.additional_upgrades` reused for "also unmarked" — semantic abuse
 - [ ] MarkPreview construction split between app.rs and core.rs — should all live in core
-- [ ] `compute_plan()` + `rebuild_list()` always called together — consider combined method
-- [ ] `Settings` uses 6 separate bools for column visibility — `HashSet<Column>` more maintainable
-- [ ] Progress rendering passes 11 args — extract renderable state struct
 
 ## UI/UX
 
