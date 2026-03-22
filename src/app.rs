@@ -677,23 +677,11 @@ impl App {
     }
 
     pub fn select_first_package(&mut self) {
-        if self.core.package_count() == 0 {
-            return;
-        }
-        self.ui.table_state.select(Some(0));
-        self.center_scroll_offset();
-        self.details.scroll = 0;
-        self.update_cached_deps();
+        self.move_package_selection(-(self.core.package_count() as i32));
     }
 
     pub fn select_last_package(&mut self) {
-        if self.core.package_count() == 0 {
-            return;
-        }
-        self.ui.table_state.select(Some(self.core.package_count() - 1));
-        self.center_scroll_offset();
-        self.details.scroll = 0;
-        self.update_cached_deps();
+        self.move_package_selection(self.core.package_count() as i32);
     }
 
     /// Set the table viewport offset so the selected row stays vertically centered.

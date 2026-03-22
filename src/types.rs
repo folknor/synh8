@@ -88,11 +88,6 @@ impl ReadableState for Clean {}
 impl ReadableState for Dirty {}
 impl ReadableState for Planned {}
 
-/// Marker trait for states where user can modify marks
-pub trait MarkableState {}
-impl MarkableState for Clean {}
-impl MarkableState for Dirty {}
-
 // ============================================================================
 // Legacy Types (for UI compatibility during migration)
 // ============================================================================
@@ -418,7 +413,7 @@ impl Column {
 }
 
 /// Column width storage
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ColumnWidths {
     pub name: u16,
     pub section: u16,

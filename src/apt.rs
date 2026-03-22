@@ -18,7 +18,7 @@ use crate::types::*;
 pub struct AptCache {
     cache: Cache,
     /// Map from package full name (e.g., "libfoo:amd64") to stable PackageId
-    pub fullname_to_id: HashMap<String, PackageId>,
+    pub(crate) fullname_to_id: HashMap<String, PackageId>,
     /// Reverse map: PackageId -> full name
     id_to_fullname: Vec<String>,
     /// Native architecture (e.g., "amd64")
@@ -106,7 +106,7 @@ impl AptCache {
     }
 
     /// Get a package by full name (e.g., "libfoo:amd64" or just "libfoo")
-    pub fn get(&self, fullname: &str) -> Option<Package<'_>> {
+    pub(crate) fn get(&self, fullname: &str) -> Option<Package<'_>> {
         self.cache.get(fullname)
     }
 
@@ -196,12 +196,6 @@ impl AptCache {
     // ========================================================================
     // Package info extraction (status determined by APT state only)
     // ========================================================================
-
-    /// Extract package info by name
-    pub fn extract_package_info_by_name(&self, name: &str) -> Option<PackageInfo> {
-        let pkg = self.cache.get(name)?;
-        self.extract_package_info(&pkg)
-    }
 
     /// Extract package info from an APT Package.
     /// Returns BASE status (installed/upgradable/not-installed) - ignores APT marks.

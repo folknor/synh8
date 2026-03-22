@@ -38,7 +38,7 @@ pub struct SortSettings {
 impl Default for SortSettings {
     fn default() -> Self {
         Self {
-            sort_by: SortBy::Name,
+            sort_by: SortBy::CandidateVersion,
             ascending: true,
         }
     }
@@ -273,10 +273,6 @@ impl PackageManager<Dirty> {
         }
     }
 
-    /// Check if there are any user marks
-    pub fn has_marks(&self) -> bool {
-        !self.shared.user_intent.is_empty()
-    }
 }
 
 // Planned state - dependencies resolved, changeset computed
@@ -306,11 +302,6 @@ impl PackageManager<Planned> {
                 };
             }
         }
-    }
-
-    /// Get planning errors
-    pub fn errors(&self) -> &[String] {
-        &self.state.errors
     }
 
     /// Go back to modify marks (keeps marks, discards plan)
@@ -351,11 +342,6 @@ impl<S: ReadableState> PackageManager<S> {
     /// Get number of packages in current list
     pub fn package_count(&self) -> usize {
         self.shared.list.len()
-    }
-
-    /// Get user intent for a package
-    pub fn user_intent(&self, id: PackageId) -> UserIntent {
-        self.shared.user_intent.get(&id).copied().unwrap_or(UserIntent::Default)
     }
 
     /// Check if a package is user-marked
@@ -573,63 +559,6 @@ impl<S: ReadableState> PackageManager<S> {
         self.shared.cache.get_reverse_dependencies(name)
     }
 
-    /// Fetch changelog for a package
-    pub fn fetch_changelog(&self, name: &str) -> Result<Vec<String>, String> {
-        match std::process::Command::new("apt")
-            .args(["changelog", name])
-            .output()
-        {
-            Ok(output) => {
-                if output.status.success() {
-                    let content = String::from_utf8_lossy(&output.stdout);
-                    let lines: Vec<String> = content.lines().map(std::string::ToString::to_string).collect();
-                    if lines.is_empty() {
-                        Ok(vec!["No changelog available.".to_string()])
-                    } else {
-                        Ok(lines)
-                    }
-                } else {
-                    let err = String::from_utf8_lossy(&output.stderr);
-                    Err(format!("Error: {err}"))
-                }
-            }
-            Err(e) => Err(format!("Failed to run apt changelog: {e}")),
-        }
-    }
-
-    /// Update all cached package counts
-    pub fn update_cache_counts(&mut self) {
-        self.shared.compute_cache_counts();
-    }
-
-    /// Refresh the APT cache.
-    /// Caller is responsible for checking the APT lock first.
-    pub fn refresh(&mut self) -> Result<(), String> {
-        self.shared.cache.refresh().map_err(|e| e.to_string())?;
-        self.shared.user_intent.clear();
-        self.shared.filter_cache.clear();
-        self.shared.search.index = None;
-        self.shared.search.query.clear();
-        self.shared.search.results = None;
-        self.update_cache_counts();
-        Ok(())
-    }
-
-    /// Run `apt update` with caller-provided progress, then refresh.
-    /// Caller is responsible for checking the APT lock first.
-    pub fn update_with_progress(
-        &mut self,
-        acquire_progress: &mut rust_apt::progress::AcquireProgress,
-    ) -> Result<(), String> {
-        self.shared.cache.update_with_progress(acquire_progress)
-            .map_err(|e| e.to_string())?;
-        self.shared.user_intent.clear();
-        self.shared.search.index = None;
-        self.shared.search.query.clear();
-        self.shared.search.results = None;
-        self.update_cache_counts();
-        Ok(())
-    }
 }
 
 // ============================================================================
@@ -704,6 +633,13 @@ impl ManagerState {
         }
     }
 
+    pub fn install_size_change(&self) -> i64 {
+        match self {
+            ManagerState::Planned(m) => m.state.install_size_change,
+            _ => 0,
+        }
+    }
+
     pub fn list(&self) -> &[PackageInfo] {
         self.shared().list.as_slice()
     }
@@ -714,10 +650,6 @@ impl ManagerState {
 
     pub fn package_count(&self) -> usize {
         self.shared().list.len()
-    }
-
-    pub fn user_intent(&self, id: PackageId) -> UserIntent {
-        self.shared().user_intent.get(&id).copied().unwrap_or(UserIntent::Default)
     }
 
     pub fn is_user_marked(&self, id: PackageId) -> bool {

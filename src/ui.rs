@@ -99,13 +99,13 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         AppState::Done => Style::default().fg(Color::Green),
     };
 
-    let status_text = match app.state {
-        AppState::Searching => format!("/{}_", app.core.search_query()),
+    let status_text: std::borrow::Cow<str> = match app.state {
+        AppState::Searching => format!("/{}_", app.core.search_query()).into(),
         _ => {
             if app.core.search_result_count().is_some() {
-                format!("[Search: {}] {}", app.core.search_query(), app.status_message)
+                format!("[Search: {}] {}", app.core.search_query(), app.status_message).into()
             } else {
-                app.status_message.clone()
+                (&*app.status_message).into()
             }
         }
     };
@@ -654,9 +654,9 @@ fn render_changes_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             lines.push(Line::from(""));
         }
 
-        // Download and size info
-        let download_size: u64 = changes.iter().map(|c| c.download_size).sum();
-        let size_change: i64 = changes.iter().map(|c| c.size_change).sum();
+        // Download and size info (use precomputed values from plan)
+        let download_size = app.core.download_size();
+        let size_change = app.core.install_size_change();
 
         lines.push(Line::from(""));
         lines.push(Line::from(format!(
