@@ -178,15 +178,10 @@ impl AptCache {
 
     /// Clear all marks on all packages
     pub(crate) fn clear_all_marks(&self) {
-        // Collect fullnames first to avoid iterator invalidation issues
-        let to_clear: Vec<_> = self.cache.get_changes(false)
-            .map(|pkg| pkg.fullname(false))
-            .collect();
-
-        for fullname in &to_clear {
-            if let Some(pkg) = self.cache.get(fullname) {
-                pkg.mark_keep();
-            }
+        // Use depcache init to bulk-reset all marks in a single C++ call,
+        // instead of iterating get_changes() and calling mark_keep() per package.
+        if let Err(e) = self.cache.depcache().clear_marked() {
+            eprintln!("Warning: clear_marked() failed: {e}");
         }
     }
 

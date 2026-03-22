@@ -189,96 +189,103 @@ impl PackageManager<Dirty> {
     #[hotpath::measure]
     pub fn plan(mut self) -> PackageManager<Planned> {
         // 1. Clear all APT marks
-        self.shared.cache.clear_all_marks();
+        hotpath::measure_block!("plan::clear_marks", {
+            self.shared.cache.clear_all_marks();
+        });
 
         // 2. Apply user intent to APT cache
-        for (&id, &intent) in &self.shared.user_intent {
-            match intent {
-                UserIntent::Install => self.shared.cache.mark_install_id(id),
-                UserIntent::Remove => self.shared.cache.mark_delete_id(id),
-                UserIntent::Hold => self.shared.cache.mark_keep_id(id),
-                UserIntent::Default => {}
+        hotpath::measure_block!("plan::apply_intents", {
+            for (&id, &intent) in &self.shared.user_intent {
+                match intent {
+                    UserIntent::Install => self.shared.cache.mark_install_id(id),
+                    UserIntent::Remove => self.shared.cache.mark_delete_id(id),
+                    UserIntent::Hold => self.shared.cache.mark_keep_id(id),
+                    UserIntent::Default => {}
+                }
             }
-        }
+        });
 
         // 3. Resolve dependencies
-        let errors = hotpath::measure_block!("resolve", {
+        let errors = hotpath::measure_block!("plan::resolve", {
             match self.shared.cache.resolve() {
                 Ok(()) => Vec::new(),
                 Err(e) => vec![format_apt_errors(&e)],
             }
         });
 
-        // 4. Build changeset from APT state
-        // Collect package data first to avoid borrow conflict
-        let change_data: Vec<_> = self.shared.cache.get_changes()
-            .map(|pkg| {
-                let fullname = pkg.fullname(false);
-                let is_installed = pkg.is_installed();
-                let marked_install = pkg.marked_install();
-                let marked_upgrade = pkg.marked_upgrade();
-                let marked_delete = pkg.marked_delete();
-                let candidate_info = pkg.candidate().map(|c| (c.size(), c.installed_size()));
-                (fullname, is_installed, marked_install, marked_upgrade, marked_delete, candidate_info)
-            })
-            .collect();
+        // 4. Collect raw change data from APT state
+        // (separate pass to avoid borrow conflict)
+        let change_data: Vec<_> = hotpath::measure_block!("plan::get_changes", {
+            self.shared.cache.get_changes()
+                .map(|pkg| {
+                    let fullname = pkg.fullname(false);
+                    let is_installed = pkg.is_installed();
+                    let marked_install = pkg.marked_install();
+                    let marked_upgrade = pkg.marked_upgrade();
+                    let marked_delete = pkg.marked_delete();
+                    let candidate_info = pkg.candidate().map(|c| (c.size(), c.installed_size()));
+                    (fullname, is_installed, marked_install, marked_upgrade, marked_delete, candidate_info)
+                })
+                .collect()
+        });
 
+        // 5. Build PlannedChanges from raw data
         let mut changes = Vec::new();
         let mut download_size = 0u64;
         let mut install_size_change = 0i64;
 
-        for (fullname, is_installed, marked_install, marked_upgrade, marked_delete, candidate_info) in change_data {
-            // Use FULL name for ID lookup - PackageId maps to full names
-            let id = self.shared.cache.id_for(&fullname);
+        hotpath::measure_block!("plan::build_changes", {
+            for (fullname, is_installed, marked_install, marked_upgrade, marked_delete, candidate_info) in change_data {
+                let id = self.shared.cache.id_for(&fullname);
 
-            let is_user_requested = self.shared.user_intent.contains_key(&id);
+                let is_user_requested = self.shared.user_intent.contains_key(&id);
 
-            let (action, reason) = if marked_install || marked_upgrade {
-                let action = if is_installed {
-                    ChangeAction::Upgrade
+                let (action, reason) = if marked_install || marked_upgrade {
+                    let action = if is_installed {
+                        ChangeAction::Upgrade
+                    } else {
+                        ChangeAction::Install
+                    };
+                    let reason = if is_user_requested {
+                        ChangeReason::UserRequested
+                    } else {
+                        ChangeReason::Dependency
+                    };
+                    (action, reason)
+                } else if marked_delete {
+                    let reason = if is_user_requested {
+                        ChangeReason::UserRequested
+                    } else {
+                        ChangeReason::AutoRemove
+                    };
+                    (ChangeAction::Remove, reason)
                 } else {
-                    ChangeAction::Install
+                    continue;
                 };
-                let reason = if is_user_requested {
-                    ChangeReason::UserRequested
-                } else {
-                    ChangeReason::Dependency
-                };
-                (action, reason)
-            } else if marked_delete {
-                let reason = if is_user_requested {
-                    ChangeReason::UserRequested
-                } else {
-                    ChangeReason::AutoRemove
-                };
-                (ChangeAction::Remove, reason)
-            } else {
-                continue;
-            };
 
-            let (pkg_download, pkg_size_change) = if let Some((dl_size, inst_size)) = candidate_info {
-                let sz = if action == ChangeAction::Remove {
-                    -(inst_size as i64)
+                let (pkg_download, pkg_size_change) = if let Some((dl_size, inst_size)) = candidate_info {
+                    let sz = if action == ChangeAction::Remove {
+                        -(inst_size as i64)
+                    } else {
+                        inst_size as i64
+                    };
+                    (dl_size, sz)
                 } else {
-                    inst_size as i64
+                    (0, 0)
                 };
-                (dl_size, sz)
-            } else {
-                (0, 0)
-            };
 
-            download_size += pkg_download;
-            install_size_change += pkg_size_change;
+                download_size += pkg_download;
+                install_size_change += pkg_size_change;
 
-            // PlannedChange only stores PackageId - name is derived when needed
-            changes.push(PlannedChange {
-                package: id,
-                action,
-                reason,
-                download_size: pkg_download,
-                size_change: pkg_size_change,
-            });
-        }
+                changes.push(PlannedChange {
+                    package: id,
+                    action,
+                    reason,
+                    download_size: pkg_download,
+                    size_change: pkg_size_change,
+                });
+            }
+        });
 
         let planned = Planned {
             changes,
@@ -471,7 +478,7 @@ impl<S: ReadableState> PackageManager<S> {
         // First pass: collect package full names that match filters
         // (avoids borrow conflict between cache iteration and extract_package_info)
         // Use full names to properly handle multi-arch packages
-        let matching_fullnames: Vec<String> = {
+        let matching_fullnames: Vec<String> = hotpath::measure_block!("rebuild::filter_collect", {
             let search_results = &self.shared.search.results;
             let user_intent = &self.shared.user_intent;
             let fullname_to_id = &self.shared.cache.fullname_to_id;
@@ -503,41 +510,48 @@ impl<S: ReadableState> PackageManager<S> {
                 })
                 .map(|pkg| pkg.fullname(false))
                 .collect()
-        };
+        });
 
         // Second pass: extract full package info
-        for fullname in matching_fullnames {
-            if let Some(mut info) = self.shared.cache.extract_package_info_by_name(&fullname) {
-                // Update status based on user intent
-                if let Some(&intent) = self.shared.user_intent.get(&info.id) {
-                    info.status = match intent {
-                        UserIntent::Install => {
-                            if info.status == PackageStatus::Upgradable {
-                                PackageStatus::MarkedForUpgrade
-                            } else {
-                                PackageStatus::MarkedForInstall
+        hotpath::measure_block!("rebuild::extract_info", {
+            for fullname in matching_fullnames {
+                if let Some(mut info) = self.shared.cache.extract_package_info_by_name(&fullname) {
+                    // Update status based on user intent
+                    if let Some(&intent) = self.shared.user_intent.get(&info.id) {
+                        info.status = match intent {
+                            UserIntent::Install => {
+                                if info.status == PackageStatus::Upgradable {
+                                    PackageStatus::MarkedForUpgrade
+                                } else {
+                                    PackageStatus::MarkedForInstall
+                                }
                             }
-                        }
-                        UserIntent::Remove => PackageStatus::MarkedForRemove,
-                        UserIntent::Hold => PackageStatus::Keep,
-                        UserIntent::Default => info.status,
-                    };
+                            UserIntent::Remove => PackageStatus::MarkedForRemove,
+                            UserIntent::Hold => PackageStatus::Keep,
+                            UserIntent::Default => info.status,
+                        };
+                    }
+                    self.shared.list.push(info);
                 }
-                self.shared.list.push(info);
             }
-        }
+        });
 
         // Calculate column widths (use display name length, not full name)
-        let mut col_widths = ColumnWidths::new();
-        for pkg in &self.shared.list {
-            let display_len = self.shared.cache.display_name(&pkg.name).len() as u16;
-            col_widths.name = col_widths.name.max(display_len);
-            col_widths.section = col_widths.section.max(pkg.section.len() as u16);
-            col_widths.installed = col_widths.installed.max(pkg.installed_version.len() as u16);
-            col_widths.candidate = col_widths.candidate.max(pkg.candidate_version.len() as u16);
-        }
+        let col_widths = hotpath::measure_block!("rebuild::col_widths", {
+            let mut col_widths = ColumnWidths::new();
+            for pkg in &self.shared.list {
+                let display_len = self.shared.cache.display_name(&pkg.name).len() as u16;
+                col_widths.name = col_widths.name.max(display_len);
+                col_widths.section = col_widths.section.max(pkg.section.len() as u16);
+                col_widths.installed = col_widths.installed.max(pkg.installed_version.len() as u16);
+                col_widths.candidate = col_widths.candidate.max(pkg.candidate_version.len() as u16);
+            }
+            col_widths
+        });
 
-        self.sort_list();
+        hotpath::measure_block!("rebuild::sort", {
+            self.sort_list();
+        });
         col_widths
     }
 
