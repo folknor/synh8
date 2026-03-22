@@ -49,12 +49,7 @@ fn main() -> Result<()> {
                         // === Global keys (any focused pane) ===
                         match key.code {
                             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                if app.has_pending_changes() {
-                                    app.state = AppState::ConfirmExit;
-                                } else {
-                                    break;
-                                }
-                                continue;
+                                break; // Ctrl-c: quit immediately, no confirmation
                             }
                             KeyCode::Char('q') => {
                                 if app.has_pending_changes() {
@@ -68,10 +63,9 @@ fn main() -> Result<()> {
                             }
                             KeyCode::Tab => app.cycle_focus(),
                             KeyCode::BackTab => app.cycle_focus_back(),
-                            KeyCode::Char('/') | KeyCode::Char('s') => app.start_search(),
-                            KeyCode::Char(',') => app.show_settings(),
+                            KeyCode::Char('s') => app.start_search(),
+                            KeyCode::F(2) => app.show_settings(),
                             KeyCode::Char('u') => {
-                                // apt update with live progress
                                 app.update_packages_live()?;
                                 terminal.clear()?;
                             }
@@ -88,22 +82,20 @@ fn main() -> Result<()> {
                                 // === Pane-local keys ===
                                 match app.ui.focused_pane {
                                     FocusedPane::Filters => match key.code {
-                                        KeyCode::Up | KeyCode::Char('k') => app.move_filter_selection(-1),
-                                        KeyCode::Down | KeyCode::Char('j') => app.move_filter_selection(1),
+                                        KeyCode::Up => app.move_filter_selection(-1),
+                                        KeyCode::Down => app.move_filter_selection(1),
                                         KeyCode::PageUp => app.move_filter_selection(-1),
                                         KeyCode::PageDown => app.move_filter_selection(1),
-                                        KeyCode::Home | KeyCode::Char('g') => app.select_first_filter(),
-                                        KeyCode::End | KeyCode::Char('G') => app.select_last_filter(),
-                                        KeyCode::Enter | KeyCode::Char(' ') => app.apply_current_filter(),
+                                        KeyCode::Home => app.select_first_filter(),
+                                        KeyCode::End => app.select_last_filter(),
                                         _ => {}
                                     },
                                     FocusedPane::Packages => match key.code {
-                                        // Navigation
-                                        KeyCode::Up | KeyCode::Char('k') => {
+                                        KeyCode::Up => {
                                             app.move_package_selection(-1);
                                             app.update_visual_selection();
                                         }
-                                        KeyCode::Down | KeyCode::Char('j') => {
+                                        KeyCode::Down => {
                                             app.move_package_selection(1);
                                             app.update_visual_selection();
                                         }
@@ -115,15 +107,14 @@ fn main() -> Result<()> {
                                             app.move_package_selection(-10);
                                             app.update_visual_selection();
                                         }
-                                        KeyCode::Home | KeyCode::Char('g') => {
+                                        KeyCode::Home => {
                                             app.select_first_package();
                                             app.update_visual_selection();
                                         }
-                                        KeyCode::End | KeyCode::Char('G') => {
+                                        KeyCode::End => {
                                             app.select_last_package();
                                             app.update_visual_selection();
                                         }
-                                        // Package actions
                                         KeyCode::Char(' ') => {
                                             if app.ui.visual_mode {
                                                 app.toggle_multi_select();
@@ -133,17 +124,16 @@ fn main() -> Result<()> {
                                         }
                                         KeyCode::Char('v') => app.start_visual_mode(),
                                         KeyCode::Char('c') => app.show_changelog(),
-                                        KeyCode::Char('r') => app.show_changes_preview(),
+                                        KeyCode::Char('a') => app.show_changes_preview(),
                                         KeyCode::Char('x') => app.mark_all_upgrades(),
-                                        KeyCode::Char('X') => app.unmark_all(),
+                                        KeyCode::Char('z') => app.unmark_all(),
                                         _ => {}
                                     },
                                     FocusedPane::Details => match key.code {
-                                        // Navigation
-                                        KeyCode::Up | KeyCode::Char('k') => {
+                                        KeyCode::Up => {
                                             app.details.scroll = app.details.scroll.saturating_sub(1);
                                         }
-                                        KeyCode::Down | KeyCode::Char('j') => {
+                                        KeyCode::Down => {
                                             app.details.scroll = app.details.scroll.saturating_add(1);
                                         }
                                         KeyCode::PageDown => {
@@ -152,15 +142,14 @@ fn main() -> Result<()> {
                                         KeyCode::PageUp => {
                                             app.details.scroll = app.details.scroll.saturating_sub(10);
                                         }
-                                        KeyCode::Home | KeyCode::Char('g') => {
+                                        KeyCode::Home => {
                                             app.details.scroll = 0;
                                         }
-                                        KeyCode::End | KeyCode::Char('G') => {
+                                        KeyCode::End => {
                                             app.details.scroll = u16::MAX;
                                         }
-                                        // Tab switching
-                                        KeyCode::Char('[') => app.prev_details_tab(),
-                                        KeyCode::Char(']') => app.next_details_tab(),
+                                        KeyCode::Char(',') => app.prev_details_tab(),
+                                        KeyCode::Char('.') => app.next_details_tab(),
                                         _ => {}
                                     },
                                 }
@@ -174,6 +163,18 @@ fn main() -> Result<()> {
                             app.core.search_query_pop();
                             app.execute_search();
                         }
+                        KeyCode::Up | KeyCode::Down
+                        | KeyCode::PageUp | KeyCode::PageDown => {
+                            app.confirm_search();
+                            let delta = match key.code {
+                                KeyCode::Up => -1,
+                                KeyCode::Down => 1,
+                                KeyCode::PageUp => -10,
+                                KeyCode::PageDown => 10,
+                                _ => unreachable!(),
+                            };
+                            app.move_package_selection(delta);
+                        }
                         KeyCode::Char(c) => {
                             app.core.search_query_push(c);
                             app.execute_search();
@@ -181,80 +182,77 @@ fn main() -> Result<()> {
                         _ => {}
                     },
                     AppState::ShowingMarkConfirm => match key.code {
-                        KeyCode::Char('y') | KeyCode::Enter | KeyCode::Char(' ') => {
-                            app.confirm_mark();
-                        }
-                        KeyCode::Char('n') | KeyCode::Esc => app.cancel_mark(),
-                        KeyCode::Up | KeyCode::Char('k') => app.scroll_mark_confirm(-1),
-                        KeyCode::Down | KeyCode::Char('j') => app.scroll_mark_confirm(1),
+                        KeyCode::Char(' ') => app.confirm_mark(),
+                        KeyCode::Esc => app.cancel_mark(),
+                        KeyCode::Up => app.scroll_mark_confirm(-1),
+                        KeyCode::Down => app.scroll_mark_confirm(1),
                         KeyCode::PageUp => app.scroll_mark_confirm(-10),
                         KeyCode::PageDown => app.scroll_mark_confirm(10),
                         _ => {}
                     },
                     AppState::ShowingChanges => match key.code {
-                        KeyCode::Char('y') | KeyCode::Enter | KeyCode::Char(' ') => {
+                        KeyCode::Char(' ') => {
                             terminal.clear()?;
                             app.commit_changes_live()?;
                             terminal.clear()?;
                         }
-                        KeyCode::Char('n') | KeyCode::Esc => {
+                        KeyCode::Esc => {
                             app.state = AppState::Listing;
                             app.refresh_ui_state();
                         }
-                        KeyCode::Up | KeyCode::Char('k') => app.scroll_changes(-1),
-                        KeyCode::Down | KeyCode::Char('j') => app.scroll_changes(1),
+                        KeyCode::Up => app.scroll_changes(-1),
+                        KeyCode::Down => app.scroll_changes(1),
                         KeyCode::PageUp => app.scroll_changes(-10),
                         KeyCode::PageDown => app.scroll_changes(10),
                         _ => {}
                     },
                     AppState::ShowingChangelog => match key.code {
-                        KeyCode::Char('y') | KeyCode::Enter | KeyCode::Char(' ') => {
+                        KeyCode::Esc | KeyCode::Char(' ') => {
                             app.state = AppState::Listing;
                         }
-                        KeyCode::Up | KeyCode::Char('k') => app.scroll_changelog(-1),
-                        KeyCode::Down | KeyCode::Char('j') => app.scroll_changelog(1),
+                        KeyCode::Up => app.scroll_changelog(-1),
+                        KeyCode::Down => app.scroll_changelog(1),
                         KeyCode::PageUp => app.scroll_changelog(-10),
                         KeyCode::PageDown => app.scroll_changelog(10),
                         _ => {}
                     },
                     AppState::ConfirmExit => match key.code {
-                        KeyCode::Char('y') | KeyCode::Enter | KeyCode::Char(' ') => break,
-                        KeyCode::Char('n') | KeyCode::Esc => {
+                        KeyCode::Char(' ') => break,
+                        KeyCode::Esc => {
                             app.state = AppState::Listing;
                         }
                         _ => {}
                     },
                     AppState::ShowingSettings => match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => {
+                        KeyCode::Esc => {
                             app.state = AppState::Listing;
                             app.apply_current_filter();
                         }
-                        KeyCode::Up | KeyCode::Char('k') => {
+                        KeyCode::Up => {
                             if app.settings_selection > 0 {
                                 app.settings_selection -= 1;
                             }
                         }
-                        KeyCode::Down | KeyCode::Char('j') => {
+                        KeyCode::Down => {
                             if app.settings_selection < App::settings_item_count() - 1 {
                                 app.settings_selection += 1;
                             }
                         }
-                        KeyCode::Enter | KeyCode::Char(' ') => {
+                        KeyCode::Char(' ') => {
                             app.toggle_setting();
                         }
                         _ => {}
                     },
                     AppState::Upgrading => {}
                     AppState::Done => match key.code {
-                        KeyCode::Char('q') => break,
-                        KeyCode::Char('r') => {
+                        KeyCode::Esc | KeyCode::Char(' ') => {
                             app.state = AppState::Listing;
                             if let Err(e) = app.refresh_cache() {
                                 app.status_message = format!("Refresh failed: {e}");
                             }
                         }
-                        KeyCode::Up | KeyCode::Char('k') => app.scroll_output(-1),
-                        KeyCode::Down | KeyCode::Char('j') => app.scroll_output(1),
+                        KeyCode::Up => app.scroll_output(-1),
+                        KeyCode::Down => app.scroll_output(1),
                         KeyCode::PageUp => app.scroll_output(-10),
                         KeyCode::PageDown => app.scroll_output(10),
                         _ => {}

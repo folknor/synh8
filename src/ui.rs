@@ -31,7 +31,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             PackageInfo::size_str(download_size)
         )
     } else if app.core.has_marks() {
-        format!(" APT TUI │ {} marked (press 'r' to review) ",
+        format!(" APT TUI │ {} marked (press 'a' to apply) ",
             app.core.user_mark_count())
     } else {
         " APT TUI │ No changes pending ".to_string()
@@ -119,19 +119,19 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             if app.ui.visual_mode {
                 "v/Space:Mark selected │ Esc:Cancel │ ↑↓:Extend selection"
             } else if app.core.search_result_count().is_some() {
-                "Esc:Clear search │ Space:Mark │ v:Visual │ x:All │ X:None │ r:Apply │ u:Update │ q:Quit"
+                "Esc:Clear search │ Space:Mark │ v:Visual │ x:All │ z:None │ a:Apply │ q:Quit"
             } else {
-                "/:Search │ Space:Mark │ v:Visual │ x:All │ X:None │ r:Apply │ ,:Settings │ u:Update │ q:Quit"
+                "s:Search │ Space:Mark │ v:Visual │ x:All │ z:None │ a:Apply │ F2:Settings │ q:Quit"
             }
         }
         AppState::Searching => "Enter:Confirm │ Esc:Cancel │ Type to search...",
-        AppState::ShowingMarkConfirm => "y/Space/Enter:Confirm │ n/Esc:Cancel",
-        AppState::ShowingChanges => "y/Enter:Apply │ n/Esc:Cancel │ ↑↓:Scroll",
-        AppState::ShowingChangelog => "↑↓/PgUp/PgDn:Scroll │ Esc/q:Close",
-        AppState::ShowingSettings => "↑↓:Navigate │ Space/Enter:Toggle │ Esc/q:Close",
-        AppState::ConfirmExit => "y/Enter:Quit │ n/Esc:Cancel",
+        AppState::ShowingMarkConfirm => "Space:Confirm │ Esc:Cancel",
+        AppState::ShowingChanges => "Space:Apply │ Esc:Cancel │ ↑↓:Scroll",
+        AppState::ShowingChangelog => "↑↓:Scroll │ Esc/Space:Close",
+        AppState::ShowingSettings => "↑↓:Navigate │ Space:Toggle │ Esc:Close",
+        AppState::ConfirmExit => "Space:Quit │ Esc:Cancel",
         AppState::Upgrading => "Applying changes...",
-        AppState::Done => "↑↓/PgUp/PgDn:Scroll │ r:Refresh │ q:Quit",
+        AppState::Done => "↑↓:Scroll │ Space:Continue │ Esc:Continue",
     };
     let help = Paragraph::new(help_text)
         .style(Style::default().fg(Color::DarkGray))
@@ -874,7 +874,7 @@ fn render_mark_preview_modal(frame: &mut Frame, app: &App, area: Rect) {
         1,
     );
     let hint = Paragraph::new(Span::styled(
-        " y/Enter: Confirm │ n/Esc: Cancel │ j/k: Scroll ",
+        " Space: Confirm │ Esc: Cancel │ ↑↓: Scroll ",
         Style::default().fg(Color::DarkGray),
     ))
     .alignment(Alignment::Center);
@@ -900,7 +900,7 @@ fn render_exit_confirm_modal(frame: &mut Frame, _app: &App, area: Rect) {
         Line::from("Really quit without applying?"),
         Line::from(""),
         Line::from(Span::styled(
-            "y/Enter: Quit │ n/Esc: Cancel",
+            "Space: Quit │ Esc: Cancel",
             Style::default().fg(Color::DarkGray),
         )),
     ];

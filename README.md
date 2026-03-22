@@ -35,22 +35,22 @@ A Synaptic-inspired TUI for managing APT packages on Debian/Ubuntu systems, buil
 
 ## Keybindings
 
-Navigation keys (`j`/`k`, arrows, `PgUp`/`PgDn`, `g`/`G`) act on the focused pane.
+Arrow keys, PgUp/PgDn, Home/End act on the focused pane.
 `Tab`/`Shift+Tab` cycles focus between Filters, Packages, and Details.
 
 | Key | Context | Action |
 |-----|---------|--------|
-| `/`, `s` | Global | Search |
+| `s` | Global | Search |
 | `u` | Global | Run apt update |
-| `,` | Global | Settings (columns, sort) |
-| `\\` | Global | Clear active search |
+| `F2` | Global | Settings (columns, sort) |
+| `Esc` | Global | Clear search / cancel visual mode |
 | `Space` | Packages | Toggle mark |
 | `v` | Packages | Visual mode (multi-select) |
 | `c` | Packages | View changelog |
-| `r` | Packages | Review and apply changes |
+| `a` | Packages | Apply pending changes |
 | `x` | Packages | Mark all upgradable |
-| `X` | Packages | Unmark all |
-| `[`/`]` | Details | Switch tab (Info/Deps/RDeps) |
+| `z` | Packages | Unmark all |
+| `,`/`.` | Details | Switch tab (Info/Deps/RDeps) |
 | `q` | Any | Quit |
 
 ## Building

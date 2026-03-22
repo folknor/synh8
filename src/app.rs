@@ -439,7 +439,7 @@ impl App {
             self.ui.visual_mode = true;
             self.ui.selection_anchor = Some(current_idx);
             self.ui.visual_range = Some((current_idx, current_idx));
-            self.status_message = "-- VISUAL -- (move to select, v/Space to mark, Esc to cancel)".to_string();
+            self.status_message = "-- VISUAL -- (↑↓ to select, Space to mark, Esc to cancel)".to_string();
         } else {
             self.mark_selected_packages();
         }
@@ -887,7 +887,7 @@ impl App {
         let mark_count = self.core.user_mark_count();
         if mark_count > 0 {
             self.status_message = format!(
-                "{mark_count} packages marked | {} upgradable | Press 'r' to review",
+                "{mark_count} packages marked | {} upgradable | Press 'a' to apply",
                 self.core.upgradable_count()
             );
         } else {
@@ -946,11 +946,11 @@ impl App {
         match result {
             Ok(()) => {
                 self.state = AppState::Done;
-                self.status_message = "Changes applied successfully. Press 'q' to quit or 'r' to refresh.".to_string();
+                self.status_message = "Changes applied successfully. Space to continue.".to_string();
             }
             Err(e) => {
                 self.state = AppState::Done;
-                self.status_message = format!("Error: {e}. Press 'q' to quit or 'r' to refresh.");
+                self.status_message = format!("Error: {e}. Space to continue.");
             }
         }
 
