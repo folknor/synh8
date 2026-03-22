@@ -15,7 +15,15 @@
 
 ## Performance
 
-- [ ] Partial list updates - only update changed entries instead of full rebuild
+- [x] Windowed table rendering - only build Row/Cell objects for visible rows (~35)
+  instead of the full list (up to 81k). Sub-millisecond per frame.
+- [x] Per-filter memoization - cache rebuild_list() results per FilterCategory.
+  Pre-warmed at startup. Filter switches ~25ms (cache hit) vs ~450ms (cold miss).
+- [x] Eliminated double rebuild_list() on filter switch.
+- [x] Replaced clear_all_marks() per-package loop with single depcache().clear_marked().
+- [x] Eliminated redundant rebuild_list() in toggle() by checking planned_changes() directly.
+- [ ] Startup takes ~2s due to pre-warming all 5 filter caches. Could be deferred
+  or made incremental (build on first access instead of eagerly).
 - [ ] Changelog fetched synchronously - `apt changelog` is run as a blocking subprocess.
   The UI freezes for several seconds on slow connections. The "Loading changelog..."
   message is set but never rendered because the draw loop blocks. (`core.rs:563-583`,
@@ -62,10 +70,8 @@
 
 ## Polish
 
-- [ ] Remember scroll position - preserve position when switching filter categories
 - [ ] Prominent search indicator - highlight active search query in status bar
 
 ## Documentation
 
 - [ ] CLI arguments - `--help`, `--version`, `--dry-run`
-- [ ] README with screenshots and feature list
