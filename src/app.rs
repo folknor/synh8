@@ -48,7 +48,6 @@ impl Default for DetailsState {
 /// Modal/popup scroll positions and content
 #[derive(Default)]
 pub struct ModalState {
-    pub mark_confirm_scroll: u16,
     pub changes_scroll: u16,
     pub changelog_scroll: u16,
     pub changelog_content: Vec<String>,
@@ -237,6 +236,14 @@ impl App {
     pub fn apply_current_filter(&mut self) {
         self.col_widths = self.core.rebuild_list();
         self.reset_selection();
+    }
+
+    pub fn select_first_filter(&mut self) {
+        self.move_filter_selection(-(FilterCategory::all().len() as i32));
+    }
+
+    pub fn select_last_filter(&mut self) {
+        self.move_filter_selection(FilterCategory::all().len() as i32);
     }
 
     pub fn move_filter_selection(&mut self, delta: i32) {
@@ -894,17 +901,10 @@ impl App {
     // === Status message ===
 
     pub fn update_status_message(&mut self) {
-        let has_marks = self.core.has_marks();
-
-        if has_marks {
-            // Count user marks
-            let mark_count = self.core.list().iter()
-                .filter(|p| self.core.is_user_marked(p.id))
-                .count();
-
+        let mark_count = self.core.user_mark_count();
+        if mark_count > 0 {
             self.status_message = format!(
-                "{} packages marked | {} upgradable | Press 'u' to review",
-                mark_count,
+                "{mark_count} packages marked | {} upgradable | Press 'r' to review",
                 self.core.upgradable_count()
             );
         } else {

@@ -35,26 +35,23 @@ A Synaptic-inspired TUI for managing APT packages on Debian/Ubuntu systems, buil
 
 ## Keybindings
 
-> **Note:** Keybindings are being reviewed and will change soon.
+Navigation keys (`j`/`k`, arrows, `PgUp`/`PgDn`, `g`/`G`) act on the focused pane.
+`Tab`/`Shift+Tab` cycles focus between Filters, Packages, and Details.
 
-| Key | Action |
-|-----|--------|
-| `j`/`k`, arrows | Navigate |
-| `g`/`G` | Jump to first/last |
-| `PageUp`/`PageDown` | Jump 10 items |
-| `Tab`/`Shift+Tab` | Cycle focus between panes |
-| `Space` | Toggle mark on package |
-| `v` | Visual mode (multi-select) |
-| `/` | Search |
-| `d` | Cycle details tab (Info/Deps/RDeps) |
-| `c` | View changelog |
-| `s` | Settings (columns, sort) |
-| `u` | Review and apply changes |
-| `x` | Mark all upgradable |
-| `N` | Unmark all |
-| `U` | Run apt update |
-| `r` | Refresh cache |
-| `q` | Quit |
+| Key | Context | Action |
+|-----|---------|--------|
+| `/`, `s` | Global | Search |
+| `u` | Global | Run apt update |
+| `,` | Global | Settings (columns, sort) |
+| `\\` | Global | Clear active search |
+| `Space` | Packages | Toggle mark |
+| `v` | Packages | Visual mode (multi-select) |
+| `c` | Packages | View changelog |
+| `r` | Packages | Review and apply changes |
+| `x` | Packages | Mark all upgradable |
+| `X` | Packages | Unmark all |
+| `[`/`]` | Details | Switch tab (Info/Deps/RDeps) |
+| `q` | Any | Quit |
 
 ## Building
 
@@ -72,6 +69,14 @@ Must be run as root:
 ```bash
 sudo ./target/release/synh8
 ```
+
+## APT locking
+
+Unlike apt, aptitude, and synaptic, synh8 does not hold the dpkg/APT lock
+while running. It checks the lock on startup and before committing changes,
+but does not prevent other tools from modifying package state while the UI
+is open. If you run `apt install` in another terminal while synh8 is open,
+synh8 won't notice — and that's fine. You're root. You know what you're doing.
 
 ## License
 

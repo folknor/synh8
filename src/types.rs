@@ -341,19 +341,6 @@ pub struct MarkPreview {
     pub bulk_acted_ids: Vec<PackageId>,
 }
 
-/// Changes to be applied
-#[derive(Debug, Default)]
-pub struct PendingChanges {
-    pub to_install: Vec<String>,
-    pub to_upgrade: Vec<String>,
-    pub to_remove: Vec<String>,
-    pub auto_install: Vec<String>,
-    pub auto_upgrade: Vec<String>,
-    pub auto_remove: Vec<String>,
-    pub download_size: u64,
-    pub install_size_change: i64,
-}
-
 /// Column configuration for the package table
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Column {
@@ -431,10 +418,4 @@ impl ColumnWidths {
         }
     }
 
-    pub fn reset(&mut self) {
-        self.name = 7;      // "Package"
-        self.section = 7;   // "Section"
-        self.installed = 9; // "Installed"
-        self.candidate = 9; // "Candidate"
-    }
 }

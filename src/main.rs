@@ -45,103 +45,128 @@ fn main() -> Result<()> {
                 }
 
                 match app.state {
-                    AppState::Listing => match key.code {
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if app.has_pending_changes() {
-                                app.state = AppState::ConfirmExit;
-                            } else {
-                                break;
+                    AppState::Listing => {
+                        // === Global keys (any focused pane) ===
+                        match key.code {
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                if app.has_pending_changes() {
+                                    app.state = AppState::ConfirmExit;
+                                } else {
+                                    break;
+                                }
+                                continue;
+                            }
+                            KeyCode::Char('q') => {
+                                if app.has_pending_changes() {
+                                    app.state = AppState::ConfirmExit;
+                                } else {
+                                    break;
+                                }
+                            }
+                            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                                app.cycle_focus_back();
+                            }
+                            KeyCode::Tab => app.cycle_focus(),
+                            KeyCode::BackTab => app.cycle_focus_back(),
+                            KeyCode::Char('/') | KeyCode::Char('s') => app.start_search(),
+                            KeyCode::Char(',') => app.show_settings(),
+                            KeyCode::Char('u') => {
+                                // apt update with live progress
+                                app.update_packages_live()?;
+                                terminal.clear()?;
+                            }
+                            KeyCode::Esc => {
+                                if app.ui.visual_mode {
+                                    app.cancel_visual_mode();
+                                } else if app.core.has_search_results() {
+                                    app.core.clear_search();
+                                    app.apply_current_filter();
+                                    app.update_status_message();
+                                }
+                            }
+                            _ => {
+                                // === Pane-local keys ===
+                                match app.ui.focused_pane {
+                                    FocusedPane::Filters => match key.code {
+                                        KeyCode::Up | KeyCode::Char('k') => app.move_filter_selection(-1),
+                                        KeyCode::Down | KeyCode::Char('j') => app.move_filter_selection(1),
+                                        KeyCode::PageUp => app.move_filter_selection(-1),
+                                        KeyCode::PageDown => app.move_filter_selection(1),
+                                        KeyCode::Home | KeyCode::Char('g') => app.select_first_filter(),
+                                        KeyCode::End | KeyCode::Char('G') => app.select_last_filter(),
+                                        KeyCode::Enter | KeyCode::Char(' ') => app.apply_current_filter(),
+                                        _ => {}
+                                    },
+                                    FocusedPane::Packages => match key.code {
+                                        // Navigation
+                                        KeyCode::Up | KeyCode::Char('k') => {
+                                            app.move_package_selection(-1);
+                                            app.update_visual_selection();
+                                        }
+                                        KeyCode::Down | KeyCode::Char('j') => {
+                                            app.move_package_selection(1);
+                                            app.update_visual_selection();
+                                        }
+                                        KeyCode::PageDown => {
+                                            app.move_package_selection(10);
+                                            app.update_visual_selection();
+                                        }
+                                        KeyCode::PageUp => {
+                                            app.move_package_selection(-10);
+                                            app.update_visual_selection();
+                                        }
+                                        KeyCode::Home | KeyCode::Char('g') => {
+                                            app.select_first_package();
+                                            app.update_visual_selection();
+                                        }
+                                        KeyCode::End | KeyCode::Char('G') => {
+                                            app.select_last_package();
+                                            app.update_visual_selection();
+                                        }
+                                        // Package actions
+                                        KeyCode::Char(' ') => {
+                                            if app.ui.visual_mode {
+                                                app.toggle_multi_select();
+                                            } else {
+                                                app.toggle_current();
+                                            }
+                                        }
+                                        KeyCode::Char('v') => app.start_visual_mode(),
+                                        KeyCode::Char('c') => app.show_changelog(),
+                                        KeyCode::Char('r') => app.show_changes_preview(),
+                                        KeyCode::Char('x') => app.mark_all_upgrades(),
+                                        KeyCode::Char('X') => app.unmark_all(),
+                                        _ => {}
+                                    },
+                                    FocusedPane::Details => match key.code {
+                                        // Navigation
+                                        KeyCode::Up | KeyCode::Char('k') => {
+                                            app.details.scroll = app.details.scroll.saturating_sub(1);
+                                        }
+                                        KeyCode::Down | KeyCode::Char('j') => {
+                                            app.details.scroll = app.details.scroll.saturating_add(1);
+                                        }
+                                        KeyCode::PageDown => {
+                                            app.details.scroll = app.details.scroll.saturating_add(10);
+                                        }
+                                        KeyCode::PageUp => {
+                                            app.details.scroll = app.details.scroll.saturating_sub(10);
+                                        }
+                                        KeyCode::Home | KeyCode::Char('g') => {
+                                            app.details.scroll = 0;
+                                        }
+                                        KeyCode::End | KeyCode::Char('G') => {
+                                            app.details.scroll = u16::MAX;
+                                        }
+                                        // Tab switching
+                                        KeyCode::Char('[') => app.prev_details_tab(),
+                                        KeyCode::Char(']') => app.next_details_tab(),
+                                        _ => {}
+                                    },
+                                }
                             }
                         }
-                        KeyCode::Char('q') => {
-                            if app.has_pending_changes() {
-                                app.state = AppState::ConfirmExit;
-                            } else {
-                                break;
-                            }
-                        }
-                        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            app.cycle_focus_back();
-                        }
-                        KeyCode::Tab => app.cycle_focus(),
-                        KeyCode::BackTab => app.cycle_focus_back(),
-                        KeyCode::Char('/') => app.start_search(),
-                        KeyCode::Esc => {
-                            if app.ui.visual_mode {
-                                // Cancel visual mode
-                                app.cancel_visual_mode();
-                            } else if app.core.has_search_results() {
-                                // Clear search filter
-                                app.core.clear_search();
-                                app.apply_current_filter();
-                                app.update_status_message();
-                            }
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => match app.ui.focused_pane {
-                            FocusedPane::Filters => app.move_filter_selection(-1),
-                            FocusedPane::Packages => {
-                                app.move_package_selection(-1);
-                                app.update_visual_selection();
-                            }
-                            FocusedPane::Details => {
-                                app.details.scroll = app.details.scroll.saturating_sub(1);
-                            }
-                        },
-                        KeyCode::Down | KeyCode::Char('j') => match app.ui.focused_pane {
-                            FocusedPane::Filters => app.move_filter_selection(1),
-                            FocusedPane::Packages => {
-                                app.move_package_selection(1);
-                                app.update_visual_selection();
-                            }
-                            FocusedPane::Details => {
-                                app.details.scroll = app.details.scroll.saturating_add(1);
-                            }
-                        },
-                        KeyCode::PageDown => {
-                            app.move_package_selection(10);
-                            app.update_visual_selection();
-                        }
-                        KeyCode::PageUp => {
-                            app.move_package_selection(-10);
-                            app.update_visual_selection();
-                        }
-                        KeyCode::Home | KeyCode::Char('g') => {
-                            app.select_first_package();
-                            app.update_visual_selection();
-                        }
-                        KeyCode::End | KeyCode::Char('G') => {
-                            app.select_last_package();
-                            app.update_visual_selection();
-                        }
-                        KeyCode::Char(' ') => {
-                            if app.ui.visual_mode {
-                                app.toggle_multi_select();
-                            } else {
-                                app.toggle_current();
-                            }
-                        }
-                        KeyCode::Char('v') => app.start_visual_mode(),
-                        KeyCode::Char('d') | KeyCode::Left | KeyCode::Char('h') => {
-                            app.prev_details_tab();
-                        }
-                        KeyCode::Right | KeyCode::Char('l') => app.next_details_tab(),
-                        KeyCode::Char('c') => app.show_changelog(),
-                        KeyCode::Char('s') => app.show_settings(),
-                        KeyCode::Char('u') => app.show_changes_preview(),
-                        KeyCode::Char('x') => app.mark_all_upgrades(),
-                        KeyCode::Char('N') => app.unmark_all(),
-                        KeyCode::Char('U') => {
-                            // apt update with live progress
-                            app.update_packages_live()?;
-                            terminal.clear()?;
-                        }
-                        KeyCode::Char('r') => {
-                            if let Err(e) = app.refresh_cache() {
-                                app.status_message = format!("Refresh failed: {e}");
-                            }
-                        }
-                        _ => {}
-                    },
+                    }
                     AppState::Searching => match key.code {
                         KeyCode::Esc => app.cancel_search(),
                         KeyCode::Enter => app.confirm_search(),
@@ -167,8 +192,7 @@ fn main() -> Result<()> {
                         _ => {}
                     },
                     AppState::ShowingChanges => match key.code {
-                        KeyCode::Char('y') | KeyCode::Enter => {
-                            // Clear the confirmation dialog before showing progress
+                        KeyCode::Char('y') | KeyCode::Enter | KeyCode::Char(' ') => {
                             terminal.clear()?;
                             app.commit_changes_live()?;
                             terminal.clear()?;
@@ -183,7 +207,7 @@ fn main() -> Result<()> {
                         _ => {}
                     },
                     AppState::ShowingChangelog => match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => {
+                        KeyCode::Char('y') | KeyCode::Enter | KeyCode::Char(' ') => {
                             app.state = AppState::Listing;
                         }
                         KeyCode::Up | KeyCode::Char('k') => app.scroll_changelog(-1),
@@ -193,7 +217,7 @@ fn main() -> Result<()> {
                         _ => {}
                     },
                     AppState::ConfirmExit => match key.code {
-                        KeyCode::Char('y') | KeyCode::Enter => break,
+                        KeyCode::Char('y') | KeyCode::Enter | KeyCode::Char(' ') => break,
                         KeyCode::Char('n') | KeyCode::Esc => {
                             app.state = AppState::Listing;
                         }

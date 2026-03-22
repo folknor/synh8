@@ -22,20 +22,17 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         .split(frame.area());
 
     // Get download size from planned changes if available
-    let download_size = app.core.planned_changes()
-        .map(|changes| changes.iter().map(|c| c.download_size).sum::<u64>())
-        .unwrap_or(0);
-
     let changes_count = app.total_changes_count();
     let title_text = if changes_count > 0 {
+        let download_size = app.core.download_size();
         format!(
             " APT TUI │ {} changes │ {} download ",
             changes_count,
             PackageInfo::size_str(download_size)
         )
     } else if app.core.has_marks() {
-        format!(" APT TUI │ {} marked (press 'u' to compute) ",
-            app.core.list().iter().filter(|p| app.core.is_user_marked(p.id)).count())
+        format!(" APT TUI │ {} marked (press 'r' to review) ",
+            app.core.user_mark_count())
     } else {
         " APT TUI │ No changes pending ".to_string()
     };
@@ -146,9 +143,9 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             if app.ui.visual_mode {
                 "v/Space:Mark selected │ Esc:Cancel │ ↑↓:Extend selection"
             } else if app.core.search_result_count().is_some() {
-                "/:Search │ Esc:Clear │ Space:Mark │ v:Visual │ x:All │ N:None │ u:Apply │ U:Update │ q:Quit"
+                "Esc:Clear search │ Space:Mark │ v:Visual │ x:All │ X:None │ r:Apply │ u:Update │ q:Quit"
             } else {
-                "/:Search │ Space:Mark │ v:Visual │ x:All │ N:None │ d:Deps │ s:Settings │ u:Apply │ U:Update │ q:Quit"
+                "/:Search │ Space:Mark │ v:Visual │ x:All │ X:None │ r:Apply │ ,:Settings │ u:Update │ q:Quit"
             }
         }
         AppState::Searching => "Enter:Confirm │ Esc:Cancel │ Type to search...",

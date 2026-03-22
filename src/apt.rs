@@ -194,17 +194,6 @@ impl AptCache {
     // Package info extraction (status determined by APT state only)
     // ========================================================================
 
-    /// Get basic status for a package (without user intent - that's in core)
-    pub fn get_apt_status(&self, pkg: &Package) -> AptPackageState {
-        AptPackageState {
-            is_installed: pkg.is_installed(),
-            is_upgradable: pkg.is_upgradable(),
-            marked_install: pkg.marked_install(),
-            marked_delete: pkg.marked_delete(),
-            marked_upgrade: pkg.marked_upgrade(),
-        }
-    }
-
     /// Extract package info by name
     pub fn extract_package_info_by_name(&self, name: &str) -> Option<PackageInfo> {
         let pkg = self.cache.get(name)?;
@@ -236,7 +225,7 @@ impl AptCache {
 
         let fullname = pkg.fullname(false);
         // Use get_id with FULL name since IDs are mapped to full names
-        let id = self.get_id(&fullname).unwrap_or(PackageId(u32::MAX));
+        let id = self.get_id(&fullname)?;
 
         Some(PackageInfo {
             id,
@@ -316,14 +305,6 @@ impl AptCache {
     // Statistics
     // ========================================================================
 
-    /// Count upgradable packages
-    pub fn count_upgradable(&self) -> usize {
-        self.cache
-            .packages(&PackageSort::default())
-            .filter(rust_apt::Package::is_upgradable)
-            .count()
-    }
-
     // ========================================================================
     // Cache lifecycle
     // ========================================================================
@@ -332,17 +313,6 @@ impl AptCache {
     pub fn refresh(&mut self) -> Result<()> {
         self.cache = Cache::new::<&str>(&[])?;
         // Note: We keep the id mappings - they're still valid names
-        Ok(())
-    }
-
-    /// Commit changes using native APT progress (text output)
-    pub(crate) fn commit(&mut self) -> Result<()> {
-        let mut acquire_progress = AcquireProgress::apt();
-        let mut install_progress = InstallProgress::apt();
-
-        let cache = std::mem::replace(&mut self.cache, Cache::new::<&str>(&[])?);
-        cache.commit(&mut acquire_progress, &mut install_progress)?;
-
         Ok(())
     }
 
@@ -368,16 +338,6 @@ impl AptCache {
         self.cache = Cache::new::<&str>(&[])?;
         Ok(())
     }
-}
-
-/// Raw APT state for a package (no interpretation)
-#[derive(Debug, Clone, Copy)]
-pub struct AptPackageState {
-    pub is_installed: bool,
-    pub is_upgradable: bool,
-    pub marked_install: bool,
-    pub marked_delete: bool,
-    pub marked_upgrade: bool,
 }
 
 /// Helper function to order dependency types by priority

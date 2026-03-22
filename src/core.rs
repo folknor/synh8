@@ -7,7 +7,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::marker::PhantomData;
 use std::os::unix::io::AsRawFd;
 
 use color_eyre::Result;
@@ -110,7 +109,6 @@ impl SharedState {
 pub struct PackageManager<S> {
     shared: SharedState,
     state: S,
-    _phantom: PhantomData<S>,
 }
 
 // Clean state - no user marks
@@ -124,7 +122,6 @@ impl PackageManager<Clean> {
         let mut mgr = Self {
             shared,
             state: Clean,
-            _phantom: PhantomData,
         };
         mgr.rebuild_list();
         Ok(mgr)
@@ -136,7 +133,6 @@ impl PackageManager<Clean> {
         PackageManager {
             shared: self.shared,
             state: Dirty,
-            _phantom: PhantomData,
         }
     }
 
@@ -146,7 +142,6 @@ impl PackageManager<Clean> {
         PackageManager {
             shared: self.shared,
             state: Dirty,
-            _phantom: PhantomData,
         }
     }
 }
@@ -171,15 +166,6 @@ impl PackageManager<Dirty> {
         self
     }
 
-    /// Set intent for a package
-    pub fn set_intent(mut self, id: PackageId, intent: UserIntent) -> Self {
-        match intent {
-            UserIntent::Default => { self.shared.user_intent.remove(&id); }
-            _ => { self.shared.user_intent.insert(id, intent); }
-        }
-        self
-    }
-
     /// Reset all marks, returning to Clean state
     pub fn reset(mut self) -> PackageManager<Clean> {
         self.shared.user_intent.clear();
@@ -187,7 +173,6 @@ impl PackageManager<Dirty> {
         PackageManager {
             shared: self.shared,
             state: Clean,
-            _phantom: PhantomData,
         }
     }
 
@@ -293,7 +278,6 @@ impl PackageManager<Dirty> {
         PackageManager {
             shared: self.shared,
             state: planned,
-            _phantom: PhantomData,
         }
     }
 
@@ -332,21 +316,6 @@ impl PackageManager<Planned> {
         }
     }
 
-    /// Get total download size
-    pub fn download_size(&self) -> u64 {
-        self.state.download_size
-    }
-
-    /// Get install size change
-    pub fn install_size_change(&self) -> i64 {
-        self.state.install_size_change
-    }
-
-    /// Check if there are planning errors
-    pub fn has_errors(&self) -> bool {
-        !self.state.errors.is_empty()
-    }
-
     /// Get planning errors
     pub fn errors(&self) -> &[String] {
         &self.state.errors
@@ -357,21 +326,7 @@ impl PackageManager<Planned> {
         PackageManager {
             shared: self.shared,
             state: Dirty,
-            _phantom: PhantomData,
         }
-    }
-
-    /// Commit the changes to the system
-    pub fn commit(mut self) -> Result<PackageManager<Clean>> {
-        self.shared.cache.commit()?;
-        self.shared.user_intent.clear();
-        self.shared.search.index = None; // Invalidate search index
-
-        Ok(PackageManager {
-            shared: self.shared,
-            state: Clean,
-            _phantom: PhantomData,
-        })
     }
 
     /// Commit the changes using caller-provided progress implementations
@@ -387,7 +342,6 @@ impl PackageManager<Planned> {
         Ok(PackageManager {
             shared: self.shared,
             state: Clean,
-            _phantom: PhantomData,
         })
     }
 }
@@ -410,11 +364,6 @@ impl<S: ReadableState> PackageManager<S> {
     /// Get a package by index in current list
     pub fn get_package(&self, index: usize) -> Option<&PackageInfo> {
         self.shared.list.get(index)
-    }
-
-    /// Get a package by PackageId
-    pub fn get_package_by_id(&self, id: PackageId) -> Option<&PackageInfo> {
-        self.shared.list.iter().find(|p| p.id == id)
     }
 
     /// Get number of packages in current list
@@ -671,12 +620,9 @@ impl<S: ReadableState> PackageManager<S> {
         self.shared.compute_cache_counts();
     }
 
-    /// Refresh the APT cache
+    /// Refresh the APT cache.
+    /// Caller is responsible for checking the APT lock first.
     pub fn refresh(&mut self) -> Result<(), String> {
-        if let Some(msg) = check_apt_lock() {
-            return Err(msg);
-        }
-
         self.shared.cache.refresh().map_err(|e| e.to_string())?;
         self.shared.user_intent.clear();
         self.shared.filter_cache.clear();
@@ -687,15 +633,12 @@ impl<S: ReadableState> PackageManager<S> {
         Ok(())
     }
 
-    /// Run `apt update` with caller-provided progress, then refresh
+    /// Run `apt update` with caller-provided progress, then refresh.
+    /// Caller is responsible for checking the APT lock first.
     pub fn update_with_progress(
         &mut self,
         acquire_progress: &mut rust_apt::progress::AcquireProgress,
     ) -> Result<(), String> {
-        if let Some(msg) = check_apt_lock() {
-            return Err(msg);
-        }
-
         self.shared.cache.update_with_progress(acquire_progress)
             .map_err(|e| e.to_string())?;
         self.shared.user_intent.clear();
@@ -733,33 +676,10 @@ impl ManagerState {
         Ok(ManagerState::Clean(PackageManager::new()?))
     }
 
-    /// Check if in Clean state
-    pub fn is_clean(&self) -> bool {
-        matches!(self, ManagerState::Clean(_))
-    }
-
-    /// Check if in Dirty state
-    pub fn is_dirty(&self) -> bool {
-        matches!(self, ManagerState::Dirty(_))
-    }
-
-    /// Check if in Planned state
-    pub fn is_planned(&self) -> bool {
-        matches!(self, ManagerState::Planned(_))
-    }
-
     /// Get the planned changes (only valid in Planned state)
     pub fn planned_changes(&self) -> Option<&[PlannedChange]> {
         match self {
             ManagerState::Planned(m) => Some(m.changes()),
-            _ => None,
-        }
-    }
-
-    /// Get plan errors (only valid in Planned state)
-    pub fn plan_errors(&self) -> Option<&[String]> {
-        match self {
-            ManagerState::Planned(m) => Some(m.errors()),
             _ => None,
         }
     }
@@ -775,6 +695,22 @@ impl ManagerState {
     }
 
     // Accessor methods that work in any state
+
+    pub fn user_mark_count(&self) -> usize {
+        match self {
+            ManagerState::Clean(_) => 0,
+            ManagerState::Dirty(m) => m.shared.user_intent.len(),
+            ManagerState::Planned(m) => m.shared.user_intent.len(),
+            ManagerState::Transitioning => panic!("Transitioning state observed"),
+        }
+    }
+
+    pub fn download_size(&self) -> u64 {
+        match self {
+            ManagerState::Planned(m) => m.state.download_size,
+            _ => 0,
+        }
+    }
 
     pub fn list(&self) -> &[PackageInfo] {
         match self {
@@ -1029,7 +965,13 @@ impl ManagerState {
 
         match filter {
             FilterCategory::Upgradable => upgradable,
-            FilterCategory::MarkedChanges => user_marks,
+            FilterCategory::MarkedChanges => {
+                // Include both user-marked and dependency-marked packages
+                // from planned_changes, not just user_intent count.
+                self.planned_changes()
+                    .map(|changes| changes.len())
+                    .unwrap_or(user_marks)
+            }
             FilterCategory::Installed => installed,
             FilterCategory::NotInstalled => total - installed,
             FilterCategory::All => total,
@@ -1048,17 +990,6 @@ impl ManagerState {
 
         for id in upgradable_ids {
             self.mark_install(id);
-        }
-    }
-
-    // State-specific shared access
-
-    pub fn sort_settings(&self) -> &SortSettings {
-        match self {
-            ManagerState::Clean(m) => &m.shared.sort_settings,
-            ManagerState::Dirty(m) => &m.shared.sort_settings,
-            ManagerState::Planned(m) => &m.shared.sort_settings,
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
         }
     }
 
@@ -1085,16 +1016,6 @@ impl ManagerState {
             ManagerState::Clean(m) => ManagerState::Dirty(m.mark_install(id)),
             ManagerState::Dirty(m) => ManagerState::Dirty(m.mark_install(id)),
             ManagerState::Planned(m) => ManagerState::Dirty(m.modify().mark_install(id)),
-            ManagerState::Transitioning => panic!("ManagerState::Transitioning should not be observed"),
-        };
-    }
-
-    /// Mark a package for removal, handling state transitions
-    pub fn mark_remove(&mut self, id: PackageId) {
-        *self = match std::mem::take(self) {
-            ManagerState::Clean(m) => ManagerState::Dirty(m.mark_remove(id)),
-            ManagerState::Dirty(m) => ManagerState::Dirty(m.mark_remove(id)),
-            ManagerState::Planned(m) => ManagerState::Dirty(m.modify().mark_remove(id)),
             ManagerState::Transitioning => panic!("ManagerState::Transitioning should not be observed"),
         };
     }
@@ -1264,7 +1185,7 @@ impl ManagerState {
 
                 // Add to check list for transitive deps
                 if let Some(&dep_id) = cache.fullname_to_id.get(&dep_name)
-                    .or_else(|| cache.fullname_to_id.get(&format!("{dep_name}:amd64")))
+                    .or_else(|| cache.fullname_to_id.get(&format!("{}:{}", dep_name, cache.native_arch())))
                     && let Some(fullname) = cache.fullname_of(dep_id) {
                         to_check.push(fullname.to_string());
                 }
@@ -1325,53 +1246,11 @@ impl ManagerState {
         }
     }
 
-    /// Commit planned changes.
+    /// Commit planned changes with caller-provided progress implementations.
     ///
     /// NOTE: We split the take-match-assign into two phases so that a failed
     /// commit never leaves `*self` as `Transitioning`. The inner commit
     /// consumes the `PackageManager`, so on error we must reinitialize.
-    pub fn commit(&mut self) -> Result<()> {
-        // Phase 1: take ownership and attempt the commit.
-        let taken = std::mem::take(self);
-        let result = match taken {
-            ManagerState::Clean(m) => {
-                *self = ManagerState::Clean(m);
-                return Ok(());
-            }
-            ManagerState::Dirty(m) => {
-                let planned = m.plan();
-                planned.commit()
-            }
-            ManagerState::Planned(m) => m.commit(),
-            ManagerState::Transitioning => panic!("ManagerState::Transitioning should not be observed"),
-        };
-        // Phase 2: *self is still Transitioning here — always assign before returning.
-        match result {
-            Ok(clean) => {
-                *self = ManagerState::Clean(clean);
-                Ok(())
-            }
-            Err(e) => {
-                // Inner PackageManager was consumed by the failed commit.
-                // Reinitialize a fresh cache so we don't leave Transitioning.
-                match ManagerState::new() {
-                    Ok(fresh) => *self = fresh,
-                    Err(reinit_err) => {
-                        // Double fault: commit failed AND cache won't reopen.
-                        // *self stays Transitioning — app cannot recover.
-                        return Err(e.wrap_err(format!(
-                            "additionally, failed to reinitialize package cache: {reinit_err}"
-                        )));
-                    }
-                }
-                Err(e)
-            }
-        }
-    }
-
-    /// Commit planned changes with caller-provided progress implementations.
-    ///
-    /// See [`commit`](Self::commit) for the error-recovery rationale.
     pub fn commit_with_progress(
         &mut self,
         acquire_progress: &mut rust_apt::progress::AcquireProgress,
