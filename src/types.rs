@@ -336,6 +336,9 @@ pub struct MarkPreview {
     pub additional_upgrades: Vec<String>,
     pub additional_removes: Vec<String>,
     pub download_size: u64,
+    /// PackageIds explicitly acted on in a bulk visual-mode operation.
+    /// Empty for single-package toggles. Used by cancel_mark() for reversal.
+    pub bulk_acted_ids: Vec<PackageId>,
 }
 
 /// Changes to be applied

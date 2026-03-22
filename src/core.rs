@@ -186,6 +186,7 @@ impl PackageManager<Dirty> {
     }
 
     /// Compute plan from user intent, transitioning to Planned
+    #[hotpath::measure]
     pub fn plan(mut self) -> PackageManager<Planned> {
         // 1. Clear all APT marks
         self.shared.cache.clear_all_marks();
@@ -201,10 +202,12 @@ impl PackageManager<Dirty> {
         }
 
         // 3. Resolve dependencies
-        let errors = match self.shared.cache.resolve() {
-            Ok(()) => Vec::new(),
-            Err(e) => vec![format_apt_errors(&e)],
-        };
+        let errors = hotpath::measure_block!("resolve", {
+            match self.shared.cache.resolve() {
+                Ok(()) => Vec::new(),
+                Err(e) => vec![format_apt_errors(&e)],
+            }
+        });
 
         // 4. Build changeset from APT state
         // Collect package data first to avoid borrow conflict
@@ -455,6 +458,7 @@ impl<S: ReadableState> PackageManager<S> {
     }
 
     /// Rebuild the package list based on current filter and search
+    #[hotpath::measure]
     pub fn rebuild_list(&mut self) -> ColumnWidths {
         self.shared.list.clear();
 
@@ -1051,16 +1055,16 @@ impl ManagerState {
     ///
     /// - If not marked: marks it + computes plan (deps shown in plan)
     /// - If marked (user or dep): unmarks with cascade, returns affected packages
+    #[hotpath::measure]
     pub fn toggle(&mut self, id: PackageId) -> ToggleResult {
         // First, compute plan if needed to know current marked state
         self.compute_plan();
-        self.rebuild_list();
 
-        // Check if package is currently marked (in the plan)
-        let is_currently_marked = self.list().iter()
-            .find(|p| p.id == id)
-            .map(|p| p.status.is_marked())
-            .unwrap_or(false);
+        // Check if package is in the current planned change set.
+        // This covers user-marked and dependency-marked packages without
+        // a full rebuild_list() (which would iterate the entire APT cache).
+        let is_currently_marked = self.planned_changes()
+            .is_some_and(|changes| changes.iter().any(|c| c.package == id));
 
         if is_currently_marked {
             // UNMARK flow
@@ -1399,6 +1403,7 @@ impl ManagerState {
             additional_upgrades,
             additional_removes,
             download_size,
+            bulk_acted_ids: Vec::new(),
         })
     }
 }

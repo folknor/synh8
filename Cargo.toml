@@ -3,16 +3,22 @@ name = "synh8"
 version = "0.1.0"
 edition = "2024"
 description = "A synaptic-inspired TUI for apt management."
+rust-version = "1.92"
 
 [dependencies]
 ratatui = "0.30"
 crossterm = "0.28"
 color-eyre = "0.6"
 rust-apt = "0.9"
-rusqlite = { version = "0.34", features = ["bundled"] }
+rusqlite = { version = "0.39.0", features = ["bundled"] }
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+hotpath = "0.14"
+
+[features]
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath/hotpath", "hotpath/hotpath-alloc"]
 
 [[bin]]
 name = "synh8"

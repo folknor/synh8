@@ -778,11 +778,13 @@ fn render_mark_preview_modal(frame: &mut Frame, app: &App, area: Rect) {
 
     if preview.is_marking {
         // MARK operation
-        let action = if preview.is_upgrade { "upgrade" } else { "install" };
-        lines.push(Line::from(Span::styled(
-            format!("Mark '{}' for {}?", preview.package_name, action),
-            Style::default().bold(),
-        )));
+        let header = if preview.bulk_acted_ids.len() > 1 {
+            format!("Mark {} for install/upgrade?", preview.package_name)
+        } else {
+            let action = if preview.is_upgrade { "upgrade" } else { "install" };
+            format!("Mark '{}' for {}?", preview.package_name, action)
+        };
+        lines.push(Line::from(Span::styled(header, Style::default().bold())));
         lines.push(Line::from(""));
 
         if !preview.additional_installs.is_empty() {
@@ -824,10 +826,12 @@ fn render_mark_preview_modal(frame: &mut Frame, app: &App, area: Rect) {
         )));
     } else {
         // UNMARK operation
-        lines.push(Line::from(Span::styled(
-            format!("Unmark '{}'?", preview.package_name),
-            Style::default().bold(),
-        )));
+        let header = if preview.bulk_acted_ids.len() > 1 {
+            format!("Unmark {}?", preview.package_name)
+        } else {
+            format!("Unmark '{}'?", preview.package_name)
+        };
+        lines.push(Line::from(Span::styled(header, Style::default().bold())));
         lines.push(Line::from(""));
 
         // additional_upgrades is repurposed to hold "also unmarked" packages

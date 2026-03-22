@@ -28,6 +28,11 @@ fn main() -> Result<()> {
     io::stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
+    let _hotpath = hotpath::HotpathGuardBuilder::new("synh8")
+        .percentiles(&[50, 95, 99])
+        .with_functions_limit(0)
+        .build();
+
     let mut app = App::new()?;
 
     loop {

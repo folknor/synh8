@@ -315,6 +315,7 @@ impl App {
                         additional_upgrades: also_names, // Reuse this field for "also unmarked"
                         additional_removes: Vec::new(),
                         download_size: 0,
+                        bulk_acted_ids: Vec::new(),
                     };
                     self.mark_preview = Some(preview);
                     self.mark_preview_scroll = 0;
@@ -342,34 +343,38 @@ impl App {
 
     pub fn cancel_mark(&mut self) {
         if let Some(ref preview) = self.mark_preview {
-            if preview.is_marking {
-                // Undo a mark operation - unmark the package
-                // First, find the ID using display_name comparison (immutable borrow scope)
+            if !preview.bulk_acted_ids.is_empty() {
+                // Bulk cancel: reverse by ID directly
+                if preview.is_marking {
+                    for &id in &preview.bulk_acted_ids {
+                        self.core.unmark(id);
+                    }
+                } else {
+                    for &id in &preview.bulk_acted_ids {
+                        self.core.mark_install(id);
+                    }
+                }
+                self.core.compute_plan();
+            } else if preview.is_marking {
+                // Single mark cancel: unmark the package
                 let id_to_unmark = {
                     let cache = self.core.cache();
                     self.core.list().iter()
                         .find(|p| cache.display_name(&p.name) == preview.package_name)
                         .map(|p| p.id)
                 };
-                // Now mutate (borrow dropped)
                 if let Some(id) = id_to_unmark {
                     self.core.unmark(id);
                 }
             } else {
-                // Undo an unmark operation - re-mark the USER-MARKED packages only
+                // Single unmark cancel: re-mark the USER-MARKED packages only
                 // Dependencies will be restored automatically by compute_plan()
-                //
-                // If original was user-marked: re-mark it (deps follow)
-                // If original was a dependency: re-mark the also_unmarked (they were user-marked)
                 let names_to_remark: Vec<String> = if preview.was_user_marked {
-                    // Original package was user-marked, re-mark only it
                     vec![preview.package_name.clone()]
                 } else {
-                    // Original was a dependency, re-mark the user-marked packages (in also_unmarked)
                     preview.additional_upgrades.clone()
                 };
 
-                // First, collect all IDs to remark (immutable borrow scope)
                 let ids_to_remark: Vec<_> = {
                     let cache = self.core.cache();
                     names_to_remark.iter()
@@ -381,11 +386,9 @@ impl App {
                         .collect()
                 };
 
-                // Now mutate (borrow dropped)
                 for id in ids_to_remark {
                     self.core.mark_install(id);
                 }
-                // Recompute plan after re-marking
                 self.core.compute_plan();
             }
         }
@@ -458,24 +461,197 @@ impl App {
     }
 
     fn mark_selected_packages(&mut self) {
-        // Get the PackageIds of selected packages
-        let ids_to_mark: Vec<PackageId> = self.ui.multi_select.iter()
-            .filter_map(|&idx| self.core.get_package(idx))
-            .filter(|p| p.status == PackageStatus::Upgradable || p.status == PackageStatus::NotInstalled)
-            .map(|p| p.id)
-            .collect();
+        let anchor_idx = match self.ui.selection_anchor {
+            Some(idx) => idx,
+            None => {
+                self.cancel_visual_mode();
+                return;
+            }
+        };
+
+        // Anchor row's state determines the operation for the entire selection
+        let anchor_is_marked = self.core.get_package(anchor_idx)
+            .map(|p| p.status.is_marked())
+            .unwrap_or(false);
+
+        // Collect and sort selected indices before clearing visual mode
+        let mut selected_indices: Vec<usize> = self.ui.multi_select.iter().copied().collect();
+        selected_indices.sort_unstable();
 
         self.ui.multi_select.clear();
         self.ui.selection_anchor = None;
         self.ui.visual_mode = false;
 
-        // Mark all selected packages
-        for id in ids_to_mark {
+        if anchor_is_marked {
+            self.bulk_unmark(&selected_indices);
+        } else {
+            self.bulk_mark(&selected_indices);
+        }
+    }
+
+    fn bulk_mark(&mut self, selected_indices: &[usize]) {
+        // Snapshot currently planned packages BEFORE any marks
+        let previously_planned: HashSet<PackageId> = self.core.planned_changes()
+            .map(|changes| changes.iter().map(|c| c.package).collect())
+            .unwrap_or_default();
+
+        // Filter to unmarked + (Upgradable | NotInstalled)
+        let ids_to_mark: Vec<PackageId> = selected_indices.iter()
+            .filter_map(|&idx| self.core.get_package(idx))
+            .filter(|p| !p.status.is_marked() && (
+                p.status == PackageStatus::Upgradable
+                || p.status == PackageStatus::NotInstalled
+            ))
+            .map(|p| p.id)
+            .collect();
+
+        if ids_to_mark.is_empty() {
+            self.status_message = "No packages to mark in selection".to_string();
+            return;
+        }
+
+        for &id in &ids_to_mark {
             self.core.mark_install(id);
         }
 
-        self.refresh_ui_state();
-        self.update_status_message();
+        // Single compute_plan + rebuild for all marks
+        self.core.compute_plan();
+        self.col_widths = self.core.rebuild_list();
+
+        // Diff planned changes to find new dependencies
+        let marked_id_set: HashSet<PackageId> = ids_to_mark.iter().copied().collect();
+        let mut additional_installs = Vec::new();
+        let mut additional_upgrades = Vec::new();
+        let mut additional_removes = Vec::new();
+        let mut download_size = 0u64;
+
+        if let Some(changes) = self.core.planned_changes() {
+            let cache = self.core.cache();
+            for change in changes {
+                download_size += change.download_size;
+
+                // Skip packages the user explicitly selected
+                if marked_id_set.contains(&change.package) {
+                    continue;
+                }
+                // Skip packages already planned before this bulk mark
+                if previously_planned.contains(&change.package) {
+                    continue;
+                }
+
+                let name = cache.fullname_of(change.package)
+                    .map(|n| cache.display_name(n).to_string())
+                    .unwrap_or_else(|| format!("(unknown:{})", change.package.index()));
+
+                match change.action {
+                    ChangeAction::Install => additional_installs.push(name),
+                    ChangeAction::Upgrade | ChangeAction::Downgrade => additional_upgrades.push(name),
+                    ChangeAction::Remove => additional_removes.push(name),
+                }
+            }
+        }
+
+        let has_extras = !additional_installs.is_empty()
+            || !additional_upgrades.is_empty()
+            || !additional_removes.is_empty();
+
+        if !has_extras {
+            self.refresh_ui_state();
+            self.update_status_message();
+            return;
+        }
+
+        let summary_name = if ids_to_mark.len() == 1 {
+            self.core.cache().fullname_of(ids_to_mark[0])
+                .map(|n| self.core.cache().display_name(n).to_string())
+                .unwrap_or_else(|| "1 package".to_string())
+        } else {
+            format!("{} packages", ids_to_mark.len())
+        };
+
+        self.mark_preview = Some(MarkPreview {
+            package_name: summary_name,
+            is_upgrade: false,
+            is_marking: true,
+            was_user_marked: false,
+            additional_installs,
+            additional_upgrades,
+            additional_removes,
+            download_size,
+            bulk_acted_ids: ids_to_mark,
+        });
+        self.mark_preview_scroll = 0;
+        self.state = AppState::ShowingMarkConfirm;
+    }
+
+    fn bulk_unmark(&mut self, selected_indices: &[usize]) {
+        // Snapshot all currently marked packages
+        let marked_before: HashSet<PackageId> = self.core.list().iter()
+            .filter(|p| p.status.is_marked())
+            .map(|p| p.id)
+            .collect();
+
+        // Only unmark user-marked packages (deps vanish automatically via compute_plan)
+        let ids_to_unmark: Vec<PackageId> = selected_indices.iter()
+            .filter_map(|&idx| self.core.get_package(idx))
+            .filter(|p| p.status.is_marked() && self.core.is_user_marked(p.id))
+            .map(|p| p.id)
+            .collect();
+
+        if ids_to_unmark.is_empty() {
+            self.status_message = "No user-marked packages to unmark in selection".to_string();
+            return;
+        }
+
+        for &id in &ids_to_unmark {
+            self.core.unmark(id);
+        }
+
+        // Single compute_plan + rebuild
+        self.core.compute_plan();
+        self.col_widths = self.core.rebuild_list();
+
+        // Find cascade-unmarked packages (deps no longer needed)
+        let unmarked_id_set: HashSet<PackageId> = ids_to_unmark.iter().copied().collect();
+        let cascade_unmarked: Vec<String> = {
+            let marked_after: HashSet<PackageId> = self.core.list().iter()
+                .filter(|p| p.status.is_marked())
+                .map(|p| p.id)
+                .collect();
+            let cache = self.core.cache();
+            marked_before.iter()
+                .filter(|id| !marked_after.contains(id) && !unmarked_id_set.contains(id))
+                .filter_map(|id| cache.fullname_of(*id).map(|n| cache.display_name(n).to_string()))
+                .collect()
+        };
+
+        if cascade_unmarked.is_empty() {
+            self.refresh_ui_state();
+            self.update_status_message();
+            return;
+        }
+
+        let summary_name = if ids_to_unmark.len() == 1 {
+            self.core.cache().fullname_of(ids_to_unmark[0])
+                .map(|n| self.core.cache().display_name(n).to_string())
+                .unwrap_or_else(|| "1 package".to_string())
+        } else {
+            format!("{} packages", ids_to_unmark.len())
+        };
+
+        self.mark_preview = Some(MarkPreview {
+            package_name: summary_name,
+            is_marking: false,
+            is_upgrade: false,
+            was_user_marked: true,
+            additional_installs: Vec::new(),
+            additional_upgrades: cascade_unmarked, // Reuse field for "also unmarked"
+            additional_removes: Vec::new(),
+            download_size: 0,
+            bulk_acted_ids: ids_to_unmark,
+        });
+        self.mark_preview_scroll = 0;
+        self.state = AppState::ShowingMarkConfirm;
     }
 
     // === Navigation ===
