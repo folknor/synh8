@@ -267,7 +267,8 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .enumerate()
         .map(|(local_idx, pkg)| {
             let abs_idx = offset + local_idx;
-            let is_multi_selected = app.ui.multi_select.contains(&abs_idx);
+            let is_multi_selected = app.ui.visual_range
+                .is_some_and(|(start, end)| abs_idx >= start && abs_idx <= end);
             let is_user_marked = app.core.is_user_marked(pkg.id);
 
             let cells: Vec<Cell> = visible_cols

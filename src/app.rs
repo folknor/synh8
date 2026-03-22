@@ -17,7 +17,8 @@ pub struct UiState {
     pub table_state: TableState,
     pub filter_state: ListState,
     pub focused_pane: FocusedPane,
-    pub multi_select: HashSet<usize>,
+    /// Visual mode selection range (start, end) inclusive. None when not selecting.
+    pub visual_range: Option<(usize, usize)>,
     pub selection_anchor: Option<usize>,
     pub visual_mode: bool,
     /// Visible row count in the package table (set by renderer each frame)
@@ -88,7 +89,7 @@ impl App {
                 table_state: TableState::default(),
                 filter_state,
                 focused_pane: FocusedPane::Packages,
-                multi_select: HashSet::new(),
+                visual_range: None,
                 selection_anchor: None,
                 visual_mode: false,
                 table_visible_rows: 0,
@@ -127,7 +128,7 @@ impl App {
     /// Restore selection by package name, or reset to 0 if not found
     #[hotpath::measure]
     fn restore_selection(&mut self, package_name: Option<String>) {
-        self.ui.multi_select.clear();
+        self.ui.visual_range = None;
         self.ui.selection_anchor = None;
         self.ui.visual_mode = false;
 
@@ -435,8 +436,7 @@ impl App {
         if !self.ui.visual_mode {
             self.ui.visual_mode = true;
             self.ui.selection_anchor = Some(current_idx);
-            self.ui.multi_select.clear();
-            self.ui.multi_select.insert(current_idx);
+            self.ui.visual_range = Some((current_idx, current_idx));
             self.status_message = "-- VISUAL -- (move to select, v/Space to mark, Esc to cancel)".to_string();
         } else {
             self.mark_selected_packages();
@@ -452,17 +452,13 @@ impl App {
         if let Some(anchor) = self.ui.selection_anchor {
             let start = anchor.min(current_idx);
             let end = anchor.max(current_idx);
-
-            self.ui.multi_select.clear();
-            for idx in start..=end {
-                self.ui.multi_select.insert(idx);
-            }
+            self.ui.visual_range = Some((start, end));
         }
     }
 
     pub fn cancel_visual_mode(&mut self) {
         self.ui.visual_mode = false;
-        self.ui.multi_select.clear();
+        self.ui.visual_range = None;
         self.ui.selection_anchor = None;
         self.update_status_message();
     }
@@ -489,11 +485,13 @@ impl App {
             .map(|p| p.status.is_marked())
             .unwrap_or(false);
 
-        // Collect and sort selected indices before clearing visual mode
-        let mut selected_indices: Vec<usize> = self.ui.multi_select.iter().copied().collect();
-        selected_indices.sort_unstable();
+        // Collect selected indices from visual range before clearing
+        let selected_indices: Vec<usize> = match self.ui.visual_range {
+            Some((start, end)) => (start..=end).collect(),
+            None => Vec::new(),
+        };
 
-        self.ui.multi_select.clear();
+        self.ui.visual_range = None;
         self.ui.selection_anchor = None;
         self.ui.visual_mode = false;
 

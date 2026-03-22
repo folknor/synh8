@@ -155,7 +155,10 @@ impl PackageManager<Dirty> {
     /// Reset all marks, returning to Clean state
     pub fn reset(mut self) -> PackageManager<Clean> {
         self.shared.user_intent.clear();
-        self.shared.cache.clear_all_marks();
+        self.shared
+            .cache
+            .clear_all_marks()
+            .expect("APT state corruption: failed to clear marks during reset");
         PackageManager {
             shared: self.shared,
             state: Clean,
@@ -166,7 +169,10 @@ impl PackageManager<Dirty> {
     #[hotpath::measure]
     pub fn plan(mut self) -> PackageManager<Planned> {
         // 1. Clear all APT marks
-        self.shared.cache.clear_all_marks();
+        self.shared
+            .cache
+            .clear_all_marks()
+            .expect("APT state corruption: failed to clear marks during plan");
 
         // 2. Apply user intent to APT cache
         for (&id, &intent) in &self.shared.user_intent {
@@ -415,9 +421,9 @@ impl<S: ReadableState> PackageManager<S> {
             PackageSort::default()
         };
 
-        // First pass: collect package full names that match filters
+        // First pass: collect package IDs that match filters
         // (avoids borrow conflict between cache iteration and extract_package_info)
-        let matching_fullnames: Vec<String> = {
+        let matching_ids: Vec<PackageId> = {
             let search_results = &self.shared.search.results;
             let user_intent = &self.shared.user_intent;
             let fullname_to_id = &self.shared.cache.fullname_to_id;
@@ -446,13 +452,13 @@ impl<S: ReadableState> PackageManager<S> {
 
                     matches_category && matches_search
                 })
-                .map(|pkg| pkg.fullname(false))
+                .filter_map(|pkg| fullname_to_id.get(&pkg.fullname(false)).copied())
                 .collect()
         };
 
         // Second pass: extract full package info (base statuses only)
-        for fullname in matching_fullnames {
-            if let Some(info) = self.shared.cache.extract_package_info_by_name(&fullname) {
+        for id in matching_ids {
+            if let Some(info) = self.shared.cache.get_by_id(id).and_then(|pkg| self.shared.cache.extract_package_info(&pkg)) {
                 self.shared.list.push(info);
             }
         }
@@ -982,22 +988,25 @@ impl ManagerState {
 
     /// Internal: handle marking a package
     fn toggle_mark_impl(&mut self, id: PackageId) -> ToggleResult {
-        // Get marked packages before
-        let marked_before: HashSet<PackageId> = self.list().iter()
-            .filter(|p| p.status.is_marked())
-            .map(|p| p.id)
-            .collect();
+        // Snapshot planned changes before marking (small set, not full list)
+        let planned_before: HashSet<PackageId> = self.planned_changes()
+            .map(|changes| changes.iter().map(|c| c.package).collect())
+            .unwrap_or_default();
 
         // Mark and compute plan
         self.mark_install(id);
         self.compute_plan();
         self.rebuild_list();
 
-        // Find newly marked packages (deps)
-        let newly_marked: Vec<PackageId> = self.list().iter()
-            .filter(|p| p.status.is_marked() && !marked_before.contains(&p.id) && p.id != id)
-            .map(|p| p.id)
-            .collect();
+        // Find newly planned packages (deps) by diffing the small planned sets
+        let newly_marked: Vec<PackageId> = self.planned_changes()
+            .map(|changes| {
+                changes.iter()
+                    .filter(|c| c.package != id && !planned_before.contains(&c.package))
+                    .map(|c| c.package)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         ToggleResult::Marked {
             package: id,
@@ -1007,15 +1016,13 @@ impl ManagerState {
 
     /// Internal: handle unmarking a package with cascade
     fn toggle_unmark(&mut self, id: PackageId) -> ToggleResult {
-        // Get all currently marked packages
-        let marked_before: Vec<PackageId> = self.list().iter()
-            .filter(|p| p.status.is_marked())
-            .map(|p| p.id)
-            .collect();
+        // Snapshot planned changes before unmarking (small set, not full list)
+        let planned_before: HashSet<PackageId> = self.planned_changes()
+            .map(|changes| changes.iter().map(|c| c.package).collect())
+            .unwrap_or_default();
 
         // Determine what to remove from user_intent
         let to_remove: Vec<PackageId> = if self.is_user_marked(id) {
-            // Package is user-marked: just remove it
             vec![id]
         } else {
             // Package is a dependency: find user_intent packages that depend on it
@@ -1031,23 +1038,18 @@ impl ManagerState {
         self.compute_plan();
         self.rebuild_list();
 
-        // Find what got unmarked
-        let marked_after: HashSet<PackageId> = self.list().iter()
-            .filter(|p| p.status.is_marked())
-            .map(|p| p.id)
-            .collect();
+        // Diff planned sets to find what got unmarked
+        let planned_after: HashSet<PackageId> = self.planned_changes()
+            .map(|changes| changes.iter().map(|c| c.package).collect())
+            .unwrap_or_default();
 
-        // Check if the target package is still marked (unmark failed)
-        let target_still_marked = marked_after.contains(&id);
-
-        if target_still_marked {
-            // Couldn't unmark - this is a dependency we can't trace back to user_intent
-            // Return NoChange to signal the UI should show a message
+        // Check if the target package is still planned (unmark failed)
+        if planned_after.contains(&id) {
             return ToggleResult::NoChange { package: id };
         }
 
-        let also_unmarked: Vec<PackageId> = marked_before.iter()
-            .filter(|pkg_id| !marked_after.contains(pkg_id) && **pkg_id != id)
+        let also_unmarked: Vec<PackageId> = planned_before.iter()
+            .filter(|pkg_id| !planned_after.contains(pkg_id) && **pkg_id != id)
             .copied()
             .collect();
 

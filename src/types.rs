@@ -376,7 +376,7 @@ impl Column {
     }
 
     pub fn visible_columns(settings: &Settings) -> Vec<Column> {
-        let mut cols = Vec::new();
+        let mut cols = Vec::with_capacity(6);
         if settings.show_status_column {
             cols.push(Self::Status);
         }

@@ -176,13 +176,16 @@ impl AptCache {
         }
     }
 
-    /// Clear all marks on all packages
-    pub(crate) fn clear_all_marks(&self) {
+    /// Clear all marks on all packages.
+    /// Returns an error if the APT depcache cannot be reset, which would leave
+    /// stale marks that corrupt subsequent planning operations.
+    pub(crate) fn clear_all_marks(&self) -> Result<(), String> {
         // Use depcache init to bulk-reset all marks in a single C++ call,
         // instead of iterating get_changes() and calling mark_keep() per package.
-        if let Err(e) = self.cache.depcache().clear_marked() {
-            eprintln!("Warning: clear_marked() failed: {e}");
-        }
+        self.cache
+            .depcache()
+            .clear_marked()
+            .map_err(|e| format!("clear_marked() failed: {e}"))
     }
 
     /// Resolve dependencies
