@@ -105,11 +105,6 @@ impl AptCache {
         self.fullname_of(id).and_then(|fullname| self.cache.get(fullname))
     }
 
-    /// Get a package by full name (e.g., "libfoo:amd64" or just "libfoo")
-    pub(crate) fn get(&self, fullname: &str) -> Option<Package<'_>> {
-        self.cache.get(fullname)
-    }
-
     // ========================================================================
     // Package iteration
     // ========================================================================

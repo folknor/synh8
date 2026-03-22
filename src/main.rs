@@ -199,6 +199,7 @@ fn main() -> Result<()> {
                         }
                         KeyCode::Char('n') | KeyCode::Esc => {
                             app.state = AppState::Listing;
+                            app.refresh_ui_state();
                         }
                         KeyCode::Up | KeyCode::Char('k') => app.scroll_changes(-1),
                         KeyCode::Down | KeyCode::Char('j') => app.scroll_changes(1),

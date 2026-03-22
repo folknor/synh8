@@ -118,7 +118,7 @@ impl App {
 
     /// Refresh UI state after core changes, preserving selection by package name
     #[hotpath::measure]
-    fn refresh_ui_state(&mut self) {
+    pub fn refresh_ui_state(&mut self) {
         let selected_name = self.selected_package().map(|p| p.name.clone());
         self.col_widths = self.core.rebuild_list();
         self.restore_selection(selected_name);
@@ -904,6 +904,12 @@ impl App {
     pub fn commit_changes_live(&mut self) -> Result<()> {
         use std::cell::RefCell;
         use std::rc::Rc;
+
+        if let Some(msg) = check_apt_lock() {
+            self.status_message = msg;
+            self.state = AppState::Listing;
+            return Ok(());
+        }
 
         self.state = AppState::Upgrading;
 

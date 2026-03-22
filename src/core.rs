@@ -813,6 +813,8 @@ impl ManagerState {
         shared.search.query.clear();
         shared.search.results = None;
         shared.compute_cache_counts();
+        // Transition to Clean to discard any stale Planned/Dirty state
+        self.reset();
         Ok(())
     }
 
@@ -1153,10 +1155,13 @@ impl ManagerState {
         shared.cache.update_with_progress(acquire_progress)
             .map_err(|e| e.to_string())?;
         shared.user_intent.clear();
+        shared.filter_cache.clear();
         shared.search.index = None;
         shared.search.query.clear();
         shared.search.results = None;
         shared.compute_cache_counts();
+        // Transition to Clean to discard any stale Planned/Dirty state
+        self.reset();
         Ok(())
     }
 
