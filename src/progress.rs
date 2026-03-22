@@ -45,12 +45,36 @@ impl StdioRedirect {
         let capture_path = std::env::temp_dir().join("synh8-apt-output.tmp");
         unsafe {
             let saved_stdout = libc::dup(libc::STDOUT_FILENO);
+            if saved_stdout == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             let saved_stderr = libc::dup(libc::STDERR_FILENO);
+            if saved_stderr == -1 {
+                libc::close(saved_stdout);
+                return Err(std::io::Error::last_os_error());
+            }
 
-            let file = std::fs::File::create(&capture_path)?;
+            let file = match std::fs::File::create(&capture_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    libc::close(saved_stdout);
+                    libc::close(saved_stderr);
+                    return Err(e);
+                }
+            };
             let capture_fd = file.as_raw_fd();
-            libc::dup2(capture_fd, libc::STDOUT_FILENO);
-            libc::dup2(capture_fd, libc::STDERR_FILENO);
+            if libc::dup2(capture_fd, libc::STDOUT_FILENO) == -1 {
+                libc::close(saved_stdout);
+                libc::close(saved_stderr);
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(capture_fd, libc::STDERR_FILENO) == -1 {
+                // Restore stdout before bailing out
+                libc::dup2(saved_stdout, libc::STDOUT_FILENO);
+                libc::close(saved_stdout);
+                libc::close(saved_stderr);
+                return Err(std::io::Error::last_os_error());
+            }
             // file drops here closing capture_fd, but the dup'd fds keep it open
 
             Ok(Self { saved_stdout, saved_stderr, capture_path })
@@ -72,8 +96,10 @@ impl StdioRedirect {
 impl Drop for StdioRedirect {
     fn drop(&mut self) {
         unsafe {
-            libc::dup2(self.saved_stdout, libc::STDOUT_FILENO);
-            libc::dup2(self.saved_stderr, libc::STDERR_FILENO);
+            let r1 = libc::dup2(self.saved_stdout, libc::STDOUT_FILENO);
+            debug_assert!(r1 != -1, "dup2 failed restoring stdout");
+            let r2 = libc::dup2(self.saved_stderr, libc::STDERR_FILENO);
+            debug_assert!(r2 != -1, "dup2 failed restoring stderr");
             libc::close(self.saved_stdout);
             libc::close(self.saved_stderr);
         }
@@ -139,7 +165,7 @@ impl ProgressState {
         let errors = &self.errors;
         let title = &self.title;
 
-        drop(self.terminal.draw(|frame| {
+        let _ = self.terminal.draw(|frame| {
             render_progress_modal(
                 frame,
                 phase,
@@ -153,7 +179,7 @@ impl ProgressState {
                 errors,
                 title,
             );
-        }));
+        });
     }
 }
 

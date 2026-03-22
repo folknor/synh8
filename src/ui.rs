@@ -41,7 +41,9 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     frame.render_widget(title, main_chunks[0]);
 
     match app.state {
-        AppState::Listing | AppState::Searching => {
+        AppState::Listing | AppState::Searching
+        | AppState::ShowingMarkConfirm | AppState::ConfirmExit => {
+            // Three-pane base layout (shared by listing and its modal overlays)
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
@@ -54,23 +56,13 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             render_filter_pane(frame, app, panes[0]);
             render_package_table(frame, app, panes[1]);
             render_details_pane(frame, app, panes[2]);
-        }
-        AppState::ShowingMarkConfirm => {
-            let panes = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Length(24),
-                    Constraint::Min(40),
-                    Constraint::Length(35),
-                ])
-                .split(main_chunks[1]);
 
-            render_filter_pane(frame, app, panes[0]);
-            render_package_table(frame, app, panes[1]);
-            render_details_pane(frame, app, panes[2]);
-
-            // Render the mark preview modal on top
-            render_mark_preview_modal(frame, app, main_chunks[1]);
+            // Modal overlays on top of three-pane layout
+            match app.state {
+                AppState::ShowingMarkConfirm => render_mark_preview_modal(frame, app, main_chunks[1]),
+                AppState::ConfirmExit => render_exit_confirm_modal(frame, app, main_chunks[1]),
+                _ => {}
+            }
         }
         AppState::ShowingChanges => {
             render_changes_modal(frame, app, main_chunks[1]);
@@ -80,22 +72,6 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         }
         AppState::ShowingSettings => {
             render_settings_view(frame, app, main_chunks[1]);
-        }
-        AppState::ConfirmExit => {
-            let panes = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Length(24),
-                    Constraint::Min(40),
-                    Constraint::Length(35),
-                ])
-                .split(main_chunks[1]);
-
-            render_filter_pane(frame, app, panes[0]);
-            render_package_table(frame, app, panes[1]);
-            render_details_pane(frame, app, panes[2]);
-
-            render_exit_confirm_modal(frame, app, main_chunks[1]);
         }
         AppState::Upgrading | AppState::Done => {
             let lines: Vec<Line> = app.output_lines

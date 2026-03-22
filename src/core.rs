@@ -647,6 +647,26 @@ pub enum ManagerState {
 
 
 impl ManagerState {
+    /// Private helper: borrow the SharedState from any non-Transitioning variant.
+    fn shared(&self) -> &SharedState {
+        match self {
+            ManagerState::Clean(m) => &m.shared,
+            ManagerState::Dirty(m) => &m.shared,
+            ManagerState::Planned(m) => &m.shared,
+            ManagerState::Transitioning => panic!("Transitioning state observed"),
+        }
+    }
+
+    /// Private helper: mutably borrow the SharedState from any non-Transitioning variant.
+    fn shared_mut(&mut self) -> &mut SharedState {
+        match self {
+            ManagerState::Clean(m) => &mut m.shared,
+            ManagerState::Dirty(m) => &mut m.shared,
+            ManagerState::Planned(m) => &mut m.shared,
+            ManagerState::Transitioning => panic!("Transitioning state observed"),
+        }
+    }
+
     /// Create a new manager in Clean state
     pub fn new() -> Result<Self> {
         Ok(ManagerState::Clean(PackageManager::new()?))
@@ -662,23 +682,13 @@ impl ManagerState {
 
     /// Check if we have any user intent (marks)
     pub fn has_marks(&self) -> bool {
-        match self {
-            ManagerState::Clean(_) => false,
-            ManagerState::Dirty(m) => m.has_marks(),
-            ManagerState::Planned(m) => !m.shared.user_intent.is_empty(),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        !self.shared().user_intent.is_empty()
     }
 
     // Accessor methods that work in any state
 
     pub fn user_mark_count(&self) -> usize {
-        match self {
-            ManagerState::Clean(_) => 0,
-            ManagerState::Dirty(m) => m.shared.user_intent.len(),
-            ManagerState::Planned(m) => m.shared.user_intent.len(),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        self.shared().user_intent.len()
     }
 
     pub fn download_size(&self) -> u64 {
@@ -689,133 +699,83 @@ impl ManagerState {
     }
 
     pub fn list(&self) -> &[PackageInfo] {
-        match self {
-            ManagerState::Clean(m) => &m.shared.list,
-            ManagerState::Dirty(m) => &m.shared.list,
-            ManagerState::Planned(m) => &m.shared.list,
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        self.shared().list.as_slice()
     }
 
     pub fn get_package(&self, index: usize) -> Option<&PackageInfo> {
-        match self {
-            ManagerState::Clean(m) => m.get_package(index),
-            ManagerState::Dirty(m) => m.get_package(index),
-            ManagerState::Planned(m) => m.get_package(index),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        self.shared().list.get(index)
     }
 
     pub fn package_count(&self) -> usize {
-        match self {
-            ManagerState::Clean(m) => m.package_count(),
-            ManagerState::Dirty(m) => m.package_count(),
-            ManagerState::Planned(m) => m.package_count(),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        self.shared().list.len()
     }
 
     pub fn user_intent(&self, id: PackageId) -> UserIntent {
-        match self {
-            ManagerState::Clean(m) => m.user_intent(id),
-            ManagerState::Dirty(m) => m.user_intent(id),
-            ManagerState::Planned(m) => m.user_intent(id),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        self.shared().user_intent.get(&id).copied().unwrap_or(UserIntent::Default)
     }
 
     pub fn is_user_marked(&self, id: PackageId) -> bool {
-        match self {
-            ManagerState::Clean(m) => m.is_user_marked(id),
-            ManagerState::Dirty(m) => m.is_user_marked(id),
-            ManagerState::Planned(m) => m.is_user_marked(id),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        self.shared().user_intent.contains_key(&id)
     }
 
     pub fn selected_filter(&self) -> FilterCategory {
-        match self {
-            ManagerState::Clean(m) => m.selected_filter(),
-            ManagerState::Dirty(m) => m.selected_filter(),
-            ManagerState::Planned(m) => m.selected_filter(),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        self.shared().selected_filter
     }
 
     pub fn upgradable_count(&self) -> usize {
-        match self {
-            ManagerState::Clean(m) => m.upgradable_count(),
-            ManagerState::Dirty(m) => m.upgradable_count(),
-            ManagerState::Planned(m) => m.upgradable_count(),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        self.shared().upgradable_count
     }
 
     pub fn search_query(&self) -> &str {
-        match self {
-            ManagerState::Clean(m) => m.search_query(),
-            ManagerState::Dirty(m) => m.search_query(),
-            ManagerState::Planned(m) => m.search_query(),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        &self.shared().search.query
     }
 
     pub fn search_result_count(&self) -> Option<usize> {
-        match self {
-            ManagerState::Clean(m) => m.search_result_count(),
-            ManagerState::Dirty(m) => m.search_result_count(),
-            ManagerState::Planned(m) => m.search_result_count(),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        self.shared().search.results.as_ref().map(std::collections::HashSet::len)
     }
 
     pub fn get_dependencies(&self, name: &str) -> Vec<(String, String)> {
-        match self {
-            ManagerState::Clean(m) => m.get_dependencies(name),
-            ManagerState::Dirty(m) => m.get_dependencies(name),
-            ManagerState::Planned(m) => m.get_dependencies(name),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        self.shared().cache.get_dependencies(name)
     }
 
     pub fn get_reverse_dependencies(&self, name: &str) -> Vec<(String, String)> {
-        match self {
-            ManagerState::Clean(m) => m.get_reverse_dependencies(name),
-            ManagerState::Dirty(m) => m.get_reverse_dependencies(name),
-            ManagerState::Planned(m) => m.get_reverse_dependencies(name),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        self.shared().cache.get_reverse_dependencies(name)
     }
 
     pub fn fetch_changelog(&self, name: &str) -> Result<Vec<String>, String> {
-        match self {
-            ManagerState::Clean(m) => m.fetch_changelog(name),
-            ManagerState::Dirty(m) => m.fetch_changelog(name),
-            ManagerState::Planned(m) => m.fetch_changelog(name),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
+        match std::process::Command::new("apt")
+            .args(["changelog", name])
+            .output()
+        {
+            Ok(output) => {
+                if output.status.success() {
+                    let content = String::from_utf8_lossy(&output.stdout);
+                    let lines: Vec<String> = content.lines().map(std::string::ToString::to_string).collect();
+                    if lines.is_empty() {
+                        Ok(vec!["No changelog available.".to_string()])
+                    } else {
+                        Ok(lines)
+                    }
+                } else {
+                    let err = String::from_utf8_lossy(&output.stderr);
+                    Err(format!("Error: {err}"))
+                }
+            }
+            Err(e) => Err(format!("Failed to run apt changelog: {e}")),
         }
     }
 
     // Mutating methods that work in any state
 
     pub fn apply_filter(&mut self, filter: FilterCategory) {
-        match self {
-            ManagerState::Clean(m) => m.apply_filter(filter),
-            ManagerState::Dirty(m) => m.apply_filter(filter),
-            ManagerState::Planned(m) => m.apply_filter(filter),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        self.shared_mut().selected_filter = filter;
+        self.rebuild_list();
     }
 
     /// Set the filter category without rebuilding the list.
     /// Caller is responsible for calling rebuild_list() afterwards.
     pub fn set_filter(&mut self, filter: FilterCategory) {
-        match self {
-            ManagerState::Clean(m) => m.shared.selected_filter = filter,
-            ManagerState::Dirty(m) => m.shared.selected_filter = filter,
-            ManagerState::Planned(m) => m.shared.selected_filter = filter,
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        self.shared_mut().selected_filter = filter;
     }
 
     pub fn rebuild_list(&mut self) -> ColumnWidths {
@@ -850,94 +810,83 @@ impl ManagerState {
     }
 
     pub fn set_sort(&mut self, sort_by: SortBy, ascending: bool) {
-        match self {
-            ManagerState::Clean(m) => m.set_sort(sort_by, ascending),
-            ManagerState::Dirty(m) => m.set_sort(sort_by, ascending),
-            ManagerState::Planned(m) => m.set_sort(sort_by, ascending),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        let shared = self.shared_mut();
+        shared.sort_settings.sort_by = sort_by;
+        shared.sort_settings.ascending = ascending;
+        // Re-sort the current list in place
+        let asc = shared.sort_settings.ascending;
+        shared.list.sort_by(|a, b| {
+            let ord = match sort_by {
+                SortBy::Name => a.name.cmp(&b.name),
+                SortBy::Section => a.section.cmp(&b.section),
+                SortBy::InstalledVersion => a.installed_version.cmp(&b.installed_version),
+                SortBy::CandidateVersion => a.candidate_version.cmp(&b.candidate_version),
+            };
+            if asc { ord } else { ord.reverse() }
+        });
     }
 
     pub fn ensure_search_index(&mut self) -> Result<std::time::Duration> {
-        match self {
-            ManagerState::Clean(m) => m.ensure_search_index(),
-            ManagerState::Dirty(m) => m.ensure_search_index(),
-            ManagerState::Planned(m) => m.ensure_search_index(),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
+        let shared = self.shared_mut();
+        if shared.search.index.is_none() {
+            let mut index = SearchIndex::new()?;
+            let (_count, duration) = index.build(&shared.cache)?;
+            shared.search.index = Some(index);
+            return Ok(duration);
         }
+        Ok(std::time::Duration::ZERO)
     }
 
     pub fn set_search_query(&mut self, query: &str) -> Result<()> {
-        match self {
-            ManagerState::Clean(m) => m.set_search_query(query),
-            ManagerState::Dirty(m) => m.set_search_query(query),
-            ManagerState::Planned(m) => m.set_search_query(query),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
+        let shared = self.shared_mut();
+        shared.search.query = query.to_string();
+        if query.is_empty() {
+            shared.search.results = None;
+        } else if let Some(ref index) = shared.search.index {
+            shared.search.results = Some(index.search(query)?);
         }
+        Ok(())
     }
 
     pub fn clear_search(&mut self) {
-        match self {
-            ManagerState::Clean(m) => m.clear_search(),
-            ManagerState::Dirty(m) => m.clear_search(),
-            ManagerState::Planned(m) => m.clear_search(),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        let shared = self.shared_mut();
+        shared.search.query.clear();
+        shared.search.results = None;
     }
 
     pub fn has_search_results(&self) -> bool {
-        match self {
-            ManagerState::Clean(m) => m.shared.search.results.is_some(),
-            ManagerState::Dirty(m) => m.shared.search.results.is_some(),
-            ManagerState::Planned(m) => m.shared.search.results.is_some(),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        self.shared().search.results.is_some()
     }
 
     pub fn search_query_pop(&mut self) {
-        match self {
-            ManagerState::Clean(m) => { m.shared.search.query.pop(); }
-            ManagerState::Dirty(m) => { m.shared.search.query.pop(); }
-            ManagerState::Planned(m) => { m.shared.search.query.pop(); }
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        self.shared_mut().search.query.pop();
     }
 
     pub fn search_query_push(&mut self, c: char) {
-        match self {
-            ManagerState::Clean(m) => m.shared.search.query.push(c),
-            ManagerState::Dirty(m) => m.shared.search.query.push(c),
-            ManagerState::Planned(m) => m.shared.search.query.push(c),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        self.shared_mut().search.query.push(c);
     }
 
     pub fn refresh(&mut self) -> Result<(), String> {
-        match self {
-            ManagerState::Clean(m) => m.refresh(),
-            ManagerState::Dirty(m) => m.refresh(),
-            ManagerState::Planned(m) => m.refresh(),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        let shared = self.shared_mut();
+        shared.cache.refresh().map_err(|e| e.to_string())?;
+        shared.user_intent.clear();
+        shared.filter_cache.clear();
+        shared.search.index = None;
+        shared.search.query.clear();
+        shared.search.results = None;
+        shared.compute_cache_counts();
+        Ok(())
     }
 
     pub fn update_cache_counts(&mut self) {
-        match self {
-            ManagerState::Clean(m) => m.update_cache_counts(),
-            ManagerState::Dirty(m) => m.update_cache_counts(),
-            ManagerState::Planned(m) => m.update_cache_counts(),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        self.shared_mut().compute_cache_counts();
     }
 
     /// Get the count for a filter category
     pub fn filter_count(&self, filter: FilterCategory) -> usize {
-        let (upgradable, installed, total, user_marks) = match self {
-            ManagerState::Clean(m) => (m.shared.upgradable_count, m.shared.installed_count, m.shared.total_count, m.shared.user_intent.len()),
-            ManagerState::Dirty(m) => (m.shared.upgradable_count, m.shared.installed_count, m.shared.total_count, m.shared.user_intent.len()),
-            ManagerState::Planned(m) => (m.shared.upgradable_count, m.shared.installed_count, m.shared.total_count, m.shared.user_intent.len()),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        };
+        let shared = self.shared();
+        let (upgradable, installed, total, user_marks) =
+            (shared.upgradable_count, shared.installed_count, shared.total_count, shared.user_intent.len());
 
         match filter {
             FilterCategory::Upgradable => upgradable,
@@ -971,12 +920,7 @@ impl ManagerState {
 
     /// Get reference to the APT cache for ID lookups
     pub fn cache(&self) -> &AptCache {
-        match self {
-            ManagerState::Clean(m) => &m.shared.cache,
-            ManagerState::Dirty(m) => &m.shared.cache,
-            ManagerState::Planned(m) => &m.shared.cache,
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        &self.shared().cache
     }
 }
 
@@ -1173,12 +1117,7 @@ impl ManagerState {
 
     /// Get iterator over user_intent PackageIds
     fn user_intent_ids(&self) -> impl Iterator<Item = &PackageId> {
-        match self {
-            ManagerState::Clean(m) => m.shared.user_intent.keys(),
-            ManagerState::Dirty(m) => m.shared.user_intent.keys(),
-            ManagerState::Planned(m) => m.shared.user_intent.keys(),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        self.shared().user_intent.keys()
     }
 
     /// Reset all marks
@@ -1210,12 +1149,12 @@ impl ManagerState {
     /// Invalidate per-filter memoization cache.
     /// None = clear all entries; Some(filter) = clear only that filter.
     fn invalidate_filter_cache(&mut self, filter: Option<FilterCategory>) {
-        let shared = match self {
-            ManagerState::Clean(m) => &mut m.shared,
-            ManagerState::Dirty(m) => &mut m.shared,
-            ManagerState::Planned(m) => &mut m.shared,
-            ManagerState::Transitioning => return,
-        };
+        // Transitioning is allowed here (no-op) since compute_plan() calls this
+        // after reassigning *self, but guard against edge cases.
+        if matches!(self, ManagerState::Transitioning) {
+            return;
+        }
+        let shared = self.shared_mut();
         match filter {
             Some(f) => { shared.filter_cache.remove(&f); }
             None => shared.filter_cache.clear(),
@@ -1276,12 +1215,15 @@ impl ManagerState {
         &mut self,
         acquire_progress: &mut rust_apt::progress::AcquireProgress,
     ) -> Result<(), String> {
-        match self {
-            ManagerState::Clean(m) => m.update_with_progress(acquire_progress),
-            ManagerState::Dirty(m) => m.update_with_progress(acquire_progress),
-            ManagerState::Planned(m) => m.update_with_progress(acquire_progress),
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
+        let shared = self.shared_mut();
+        shared.cache.update_with_progress(acquire_progress)
+            .map_err(|e| e.to_string())?;
+        shared.user_intent.clear();
+        shared.search.index = None;
+        shared.search.query.clear();
+        shared.search.results = None;
+        shared.compute_cache_counts();
+        Ok(())
     }
 
     /// Build a MarkPreview from the current Planned state's changes.

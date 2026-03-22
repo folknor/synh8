@@ -355,6 +355,19 @@ impl App {
         self.state = AppState::Listing;
     }
 
+    /// Resolve a display name (which may have the native arch suffix stripped)
+    /// back to a PackageId by looking up the full cache, not the filtered list.
+    fn resolve_display_name_to_id(&self, display_name: &str) -> Option<PackageId> {
+        let cache = self.core.cache();
+        // Try the display name as-is (works for foreign-arch packages)
+        if let Some(id) = cache.get_id(display_name) {
+            return Some(id);
+        }
+        // Try with the native arch suffix appended (the common case)
+        let fullname = format!("{}:{}", display_name, cache.native_arch());
+        cache.get_id(&fullname)
+    }
+
     pub fn cancel_mark(&mut self) {
         if let Some(ref preview) = self.mark_preview {
             if !preview.bulk_acted_ids.is_empty() {
@@ -371,12 +384,7 @@ impl App {
                 self.core.compute_plan();
             } else if preview.is_marking {
                 // Single mark cancel: unmark the package
-                let id_to_unmark = {
-                    let cache = self.core.cache();
-                    self.core.list().iter()
-                        .find(|p| cache.display_name(&p.name) == preview.package_name)
-                        .map(|p| p.id)
-                };
+                let id_to_unmark = self.resolve_display_name_to_id(&preview.package_name);
                 if let Some(id) = id_to_unmark {
                     self.core.unmark(id);
                 }
@@ -389,16 +397,9 @@ impl App {
                     preview.additional_upgrades.clone()
                 };
 
-                let ids_to_remark: Vec<_> = {
-                    let cache = self.core.cache();
-                    names_to_remark.iter()
-                        .filter_map(|name| {
-                            self.core.list().iter()
-                                .find(|p| cache.display_name(&p.name) == *name)
-                                .map(|p| p.id)
-                        })
-                        .collect()
-                };
+                let ids_to_remark: Vec<_> = names_to_remark.iter()
+                    .filter_map(|name| self.resolve_display_name_to_id(name))
+                    .collect();
 
                 for id in ids_to_remark {
                     self.core.mark_install(id);
@@ -829,27 +830,23 @@ impl App {
     // === Scrolling ===
 
     pub fn scroll_changelog(&mut self, delta: i32) {
-        let max_scroll = self.modals.changelog_content.len().saturating_sub(1) as u16;
-        let current = self.modals.changelog_scroll as i32;
-        self.modals.changelog_scroll = (current + delta).clamp(0, max_scroll as i32) as u16;
+        let max = self.modals.changelog_content.len().saturating_sub(1);
+        self.modals.changelog_scroll = clamped_scroll(self.modals.changelog_scroll.into(), delta, max) as u16;
     }
 
     pub fn scroll_changes(&mut self, delta: i32) {
-        let max_scroll = self.changes_line_count().saturating_sub(5) as u16;
-        let current = self.modals.changes_scroll as i32;
-        self.modals.changes_scroll = (current + delta).clamp(0, max_scroll as i32) as u16;
+        let max = self.changes_line_count().saturating_sub(5);
+        self.modals.changes_scroll = clamped_scroll(self.modals.changes_scroll.into(), delta, max) as u16;
     }
 
     pub fn scroll_mark_confirm(&mut self, delta: i32) {
-        let max_scroll = self.mark_confirm_line_count().saturating_sub(10);
-        let current = self.mark_preview_scroll as i32;
-        self.mark_preview_scroll = (current + delta).clamp(0, max_scroll as i32) as usize;
+        let max = self.mark_confirm_line_count().saturating_sub(10);
+        self.mark_preview_scroll = clamped_scroll(self.mark_preview_scroll, delta, max);
     }
 
     pub fn scroll_output(&mut self, delta: i32) {
-        let max_scroll = self.output_lines.len().saturating_sub(1) as u16;
-        let current = self.output_scroll as i32;
-        self.output_scroll = (current + delta).clamp(0, max_scroll as i32) as u16;
+        let max = self.output_lines.len().saturating_sub(1);
+        self.output_scroll = clamped_scroll(self.output_scroll.into(), delta, max) as u16;
     }
 
     pub fn changes_line_count(&self) -> usize {
@@ -1019,4 +1016,9 @@ impl App {
         self.update_status_message();
         Ok(())
     }
+}
+
+/// Apply a clamped scroll delta to a current position.
+fn clamped_scroll(current: usize, delta: i32, max: usize) -> usize {
+    (current as i32 + delta).clamp(0, max as i32) as usize
 }
