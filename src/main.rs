@@ -166,6 +166,7 @@ fn main() -> Result<()> {
                         KeyCode::Up | KeyCode::Down
                         | KeyCode::PageUp | KeyCode::PageDown => {
                             app.confirm_search();
+                            app.ui.focused_pane = FocusedPane::Packages;
                             let delta = match key.code {
                                 KeyCode::Up => -1,
                                 KeyCode::Down => 1,

@@ -112,6 +112,8 @@ impl App {
         app.refresh_ui_state();
         // Pre-warm filter cache so all filter switches are instant
         app.core.pre_warm_filter_cache();
+        // Pre-build search index so first 's' press is instant
+        let _ = app.core.ensure_search_index();
         app.update_status_message();
         Ok(app)
     }
