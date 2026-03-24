@@ -295,17 +295,28 @@ impl App {
 
         match result {
             ToggleResult::Marked { package: _, additional } => {
-                // Package was marked - check if there are additional deps
                 if additional.is_empty() {
                     // No additional deps, just update UI
                     self.refresh_ui_state();
                     self.update_status_message();
                 } else {
-                    // Build preview for confirmation modal (only new deps)
                     let preview = self.core.build_mark_preview(id, &previously_planned);
-                    self.mark_preview = preview;
-                    self.mark_preview_scroll = 0;
-                    self.state = AppState::ShowingMarkConfirm;
+                    // Only show confirmation if the plan includes non-upgrade actions
+                    // (installs, removes). Pure upgrade deps are expected and don't
+                    // need confirmation.
+                    let needs_confirm = match &preview {
+                        Some(MarkPreview::Mark { additional_installs, additional_removes, .. }) =>
+                            !additional_installs.is_empty() || !additional_removes.is_empty(),
+                        _ => true,
+                    };
+                    if needs_confirm {
+                        self.mark_preview = preview;
+                        self.mark_preview_scroll = 0;
+                        self.state = AppState::ShowingMarkConfirm;
+                    } else {
+                        self.refresh_ui_state();
+                        self.update_status_message();
+                    }
                 }
             }
             ToggleResult::Unmarked { package: _, also_unmarked } => {
@@ -566,11 +577,12 @@ impl App {
             }
         }
 
-        let has_extras = !additional_installs.is_empty()
-            || !additional_upgrades.is_empty()
+        // Only show confirmation for non-upgrade extras (installs, removes).
+        // Pure upgrade deps are expected and don't need confirmation.
+        let needs_confirm = !additional_installs.is_empty()
             || !additional_removes.is_empty();
 
-        if !has_extras {
+        if !needs_confirm {
             self.refresh_ui_state();
             self.update_status_message();
             return;
