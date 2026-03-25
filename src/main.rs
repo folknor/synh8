@@ -38,8 +38,11 @@ fn main() -> Result<()> {
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
 
-        if event::poll(std::time::Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()? {
+        // Use a shorter poll timeout during warm-up so we process
+        // warm-up steps quickly between frames.
+        let poll_ms = if app.warm_step.is_some() { 0 } else { 100 };
+        if event::poll(std::time::Duration::from_millis(poll_ms))? {
+            if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -260,6 +263,10 @@ fn main() -> Result<()> {
                     },
                 }
             }
+        } else {
+            // Idle: do incremental warm-up work
+            app.warm_next();
+        }
     }
 
     disable_raw_mode()?;

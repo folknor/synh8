@@ -74,6 +74,10 @@ pub struct App {
     pub mark_preview: Option<MarkPreview>,
     pub mark_preview_scroll: usize,
     pub output_scroll: u16,
+
+    /// Incremental startup warm-up: index into FilterCategory::all() for next
+    /// filter to pre-warm, then search index. None = warm-up complete.
+    pub warm_step: Option<usize>,
 }
 
 impl App {
@@ -105,17 +109,53 @@ impl App {
             mark_preview: None,
             mark_preview_scroll: 0,
             output_scroll: 0,
+            warm_step: Some(0),
         };
 
         // Sync sort settings from UI settings to core
         app.core.set_sort(app.settings.sort_by, app.settings.sort_ascending);
         app.refresh_ui_state();
-        // Pre-warm filter cache so all filter switches are instant
-        app.core.pre_warm_filter_cache();
-        // Pre-build search index so first 's' press is instant
-        let _ = app.core.ensure_search_index();
         app.update_status_message();
+        // Filter cache and search index are warmed incrementally via
+        // warm_next() during idle event loop cycles.
         Ok(app)
+    }
+
+    /// Do one unit of startup warm-up work. Called during idle event loop
+    /// cycles so the UI stays responsive. Returns true if there's more
+    /// work to do.
+    pub fn warm_next(&mut self) -> bool {
+        let step = match self.warm_step {
+            Some(s) => s,
+            None => return false,
+        };
+
+        let filters = FilterCategory::all();
+        let current_filter = self.core.selected_filter();
+
+        if step < filters.len() {
+            // Pre-warm one filter cache entry per call
+            let filter = filters[step];
+            if filter != current_filter {
+                self.core.set_filter(filter);
+                self.core.rebuild_list();
+            }
+            // Restore original filter after warming a different one
+            if filter != current_filter {
+                self.core.set_filter(current_filter);
+                self.core.rebuild_list();
+            }
+            self.warm_step = Some(step + 1);
+            true
+        } else if step == filters.len() {
+            // Build search index
+            let _ = self.core.ensure_search_index();
+            self.warm_step = None;
+            false
+        } else {
+            self.warm_step = None;
+            false
+        }
     }
 
     /// Refresh UI state after core changes, preserving selection by package name
