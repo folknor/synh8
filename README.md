@@ -2,6 +2,9 @@
 
 A Synaptic-inspired TUI for managing APT packages on Debian/Ubuntu systems, built with Rust and ratatui.
 
+Built with LLMs. See [LLM.md](LLM.md).
+
+
 ## Features
 
 - Browse, search, install, upgrade, and remove packages from the terminal
