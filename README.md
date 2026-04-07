@@ -2,8 +2,9 @@
 
 A Synaptic-inspired TUI for managing APT packages on Debian/Ubuntu systems, built with Rust and ratatui.
 
-Built with LLMs. See [LLM.md](LLM.md).
+**Linux only.** Requires `libapt-pkg-dev` and root privileges.
 
+Built with LLMs. See [LLM.md](https://github.com/folknor/synh8/blob/master/LLM.md).
 
 ## Features
 
@@ -16,24 +17,20 @@ Built with LLMs. See [LLM.md](LLM.md).
 - Configurable columns and sort order
 - Changelog viewer
 
-## Layout
+## APT locking
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│ Title Bar               │ N changes │ X.X MB download        │
-├──────────┬──────────────────────────┬────────────────────────┤
-│ Filters  │      Package Table       │     Details Pane       │
-│          │                          │                        │
-│ Upgr (N) │ S  Package    Candidate  │  [Info] [Deps] [RDeps]│
-│ Marked(N)│ ↑  libfoo     1.2.3     │                        │
-│ Inst (N) │ ·  libbar     4.5.6     │  Package: libfoo       │
-│ Not  (N) │                          │  Status: ↑ Upgradable  │
-│ All  (N) │                          │  Section: libs         │
-├──────────┴──────────────────────────┴────────────────────────┤
-│ Status bar                                                   │
-├──────────────────────────────────────────────────────────────┤
-│ /:Search  Space:Mark  v:Visual  u:Review  x:Upgrade all     │
-└──────────────────────────────────────────────────────────────┘
+Unlike apt, aptitude, and synaptic, synh8 does not hold the dpkg/APT lock
+while running. It checks the lock on startup and before committing changes,
+but does not prevent other tools from modifying package state while the UI
+is open. If you run `apt install` in another terminal while synh8 is open,
+synh8 won't notice. You're root. You know what you're doing.
+
+## Usage
+
+Must be run as root:
+
+```bash
+sudo synh8
 ```
 
 ## Keybindings
@@ -56,30 +53,21 @@ Arrow keys, PgUp/PgDn, Home/End act on the focused pane.
 | `,`/`.` | Details | Switch tab (Info/Deps/RDeps) |
 | `q` | Any | Quit |
 
-## Building
-
-Requires `libapt-pkg-dev`:
+## Installation
 
 ```bash
 sudo apt install libapt-pkg-dev
-cargo build --release
+cargo install synh8
 ```
 
-## Usage
-
-Must be run as root:
+Or build from source:
 
 ```bash
-sudo ./target/release/synh8
+sudo apt install libapt-pkg-dev
+git clone https://github.com/folknor/synh8.git
+cd synh8
+cargo build --release
 ```
-
-## APT locking
-
-Unlike apt, aptitude, and synaptic, synh8 does not hold the dpkg/APT lock
-while running. It checks the lock on startup and before committing changes,
-but does not prevent other tools from modifying package state while the UI
-is open. If you run `apt install` in another terminal while synh8 is open,
-synh8 won't notice — and that's fine. You're root. You know what you're doing.
 
 ## License
 

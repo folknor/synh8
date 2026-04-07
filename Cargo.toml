@@ -2,12 +2,17 @@
 name = "synh8"
 version = "0.1.0"
 edition = "2024"
-description = "A synaptic-inspired TUI for apt management."
-rust-version = "1.92"
+description = "A synaptic-inspired TUI for managing APT packages on Debian/Ubuntu. Linux only."
+license = "MIT"
+repository = "https://github.com/folknor/synh8"
+keywords = ["apt", "tui", "debian", "ubuntu", "package-manager"]
+categories = ["command-line-utilities"]
+rust-version = "1.85"
+exclude = ["CLAUDE.md", "TODO.md"]
 
 [dependencies]
-ratatui = "0.30"
-crossterm = "0.28"
+ratatui = { version = "0.30", default-features = false, features = ["termion"] }
+termion = "4"
 color-eyre = "0.6"
 rust-apt = "0.9"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
