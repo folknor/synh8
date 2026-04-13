@@ -29,8 +29,8 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let _hotpath = hotpath::HotpathGuardBuilder::new("synh8")
-        .percentiles(&[50, 95, 99])
-        .with_functions_limit(0)
+        .percentiles(&[50.0, 95.0, 99.0])
+        .functions_limit(0)
         .build();
 
     let mut app = App::new()?;
