@@ -1,6 +1,6 @@
 [package]
 name = "synh8"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A synaptic-inspired TUI for managing APT packages on Debian/Ubuntu. Linux only."
 license = "MIT"
@@ -11,8 +11,8 @@ rust-version = "1.85"
 exclude = ["CLAUDE.md", "TODO.md"]
 
 [dependencies]
-ratatui = { version = "0.30", default-features = false, features = ["termion"] }
-termion = "4"
+ratatui = "0.30"
+crossterm = "0.29"
 color-eyre = "0.6"
 rust-apt = "0.9"
 rusqlite = { version = "0.39.0", features = ["bundled"] }

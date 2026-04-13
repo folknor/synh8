@@ -127,7 +127,7 @@ pub struct ProgressSnapshot<'a> {
 /// This allows dpkg output (which goes to fd 1) to be suppressed via
 /// `StdioRedirect` without affecting progress rendering.
 pub struct ProgressState {
-    terminal: Terminal<TermionBackend<File>>,
+    terminal: Terminal<CrosstermBackend<File>>,
     pub phase: ProgressPhase,
     // Download phase
     pub percent: f64,
@@ -149,7 +149,7 @@ impl ProgressState {
         let tty = std::fs::OpenOptions::new()
             .write(true)
             .open("/dev/tty")?;
-        let backend = TermionBackend::new(tty);
+        let backend = CrosstermBackend::new(tty);
         let terminal = Terminal::new(backend)?;
         Ok(Self {
             terminal,
