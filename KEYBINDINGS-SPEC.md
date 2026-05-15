@@ -203,7 +203,7 @@ Opened via `F2`. Configure column visibility and sort order.
 
 ## Upgrading (Progress View)
 
-Shown during `apt update` or package installation. No keys are active — the operation runs to completion.
+Shown during `apt update` or package installation. No keys are active - the operation runs to completion.
 
 ## Done (Post-Commit)
 

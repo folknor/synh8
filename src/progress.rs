@@ -283,7 +283,7 @@ impl rust_apt::progress::DynInstallProgress for TuiInstallProgress {
 }
 
 // ============================================================================
-// Rendering — compact centered modal
+// Rendering - compact centered modal
 // ============================================================================
 
 fn render_progress_modal(frame: &mut Frame, snap: &ProgressSnapshot) {

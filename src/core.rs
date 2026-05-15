@@ -575,7 +575,7 @@ pub enum ManagerState {
     /// Temporary placeholder used by `std::mem::take` during state transitions.
     /// Must never be observed outside a `&mut self` method body.
     /// SAFETY: Any method that `take`s self must assign `*self` back before
-    /// returning — including on error paths — or accessors will panic.
+    /// returning - including on error paths - or accessors will panic.
     #[default]
     Transitioning,
 }
@@ -1077,7 +1077,7 @@ impl ManagerState {
             ManagerState::Planned(m) => ManagerState::Planned(m), // Already planned
             ManagerState::Transitioning => panic!("ManagerState::Transitioning should not be observed"),
         };
-        // Marks changed — invalidate MarkedChanges cache only.
+        // Marks changed - invalidate MarkedChanges cache only.
         // Other filters (Installed/Upgradable/etc) are unaffected by marks.
         self.invalidate_filter_cache(Some(FilterCategory::MarkedChanges));
     }
@@ -1122,7 +1122,7 @@ impl ManagerState {
             }
             ManagerState::Transitioning => panic!("ManagerState::Transitioning should not be observed"),
         };
-        // *self is still Transitioning here — always assign before returning.
+        // *self is still Transitioning here - always assign before returning.
         match result {
             Ok(clean) => {
                 *self = ManagerState::Clean(clean);
@@ -1135,7 +1135,7 @@ impl ManagerState {
                     Ok(fresh) => *self = fresh,
                     Err(reinit_err) => {
                         // Double fault: commit failed AND cache won't reopen.
-                        // *self stays Transitioning — app cannot recover.
+                        // *self stays Transitioning - app cannot recover.
                         return Err(e.wrap_err(format!(
                             "additionally, failed to reinitialize package cache: {reinit_err}"
                         )));
@@ -1168,7 +1168,7 @@ impl ManagerState {
     /// Build a MarkPreview from the current Planned state's changes.
     /// Call this after marking a package and computing the plan.
     /// `previously_planned` contains PackageIds that were already in the plan
-    /// before this mark — they are excluded from the "additional" lists.
+    /// before this mark - they are excluded from the "additional" lists.
     pub fn build_mark_preview(
         &self,
         marked_pkg_id: PackageId,

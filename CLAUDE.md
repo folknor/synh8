@@ -25,8 +25,8 @@ sudo ./target/release/synh8
 
 ## Feature flags
 
-- `hotpath` — function-level timing profiling (zero overhead when disabled)
-- `hotpath-alloc` — allocation tracking
+- `hotpath` - function-level timing profiling (zero overhead when disabled)
+- `hotpath-alloc` - allocation tracking
 
 ```bash
 cargo build --release --features hotpath
@@ -42,22 +42,22 @@ Instrumented functions: `core::plan`, `core::rebuild_list`, `core::toggle`,
 
 ### Source layout
 
-- `main.rs` — event loop, key dispatch
-- `app.rs` — TUI application state, wraps `ManagerState` with UI state
-- `ui.rs` — ratatui rendering (windowed table rendering for large lists)
-- `core.rs` — typestate package manager (~1600 lines), filter caching
-- `types.rs` — enums, structs, type definitions
-- `apt.rs` — thin wrapper around rust-apt with stable `PackageId` handles
-- `search.rs` — SQLite FTS5 full-text search across package names
-- `progress.rs` — terminal progress rendering for downloads/installs
+- `main.rs` - event loop, key dispatch
+- `app.rs` - TUI application state, wraps `ManagerState` with UI state
+- `ui.rs` - ratatui rendering (windowed table rendering for large lists)
+- `core.rs` - typestate package manager (~1600 lines), filter caching
+- `types.rs` - enums, structs, type definitions
+- `apt.rs` - thin wrapper around rust-apt with stable `PackageId` handles
+- `search.rs` - SQLite FTS5 full-text search across package names
+- `progress.rs` - terminal progress rendering for downloads/installs
 
 ### Typestate pattern (core.rs)
 
 `PackageManager<S>` uses compile-time states:
 
-- **`Clean`** — no user marks. Can mark packages (→ Dirty).
-- **`Dirty`** — has marks, no computed plan. Can plan (→ Planned) or reset (→ Clean).
-- **`Planned`** — dependencies resolved, changeset computed. Can commit or modify (→ Dirty).
+- **`Clean`** - no user marks. Can mark packages (→ Dirty).
+- **`Dirty`** - has marks, no computed plan. Can plan (→ Planned) or reset (→ Clean).
+- **`Planned`** - dependencies resolved, changeset computed. Can commit or modify (→ Dirty).
 
 ```rust
 pub struct PackageManager<S> {
@@ -87,16 +87,16 @@ Invalidation: `compute_plan()` clears MarkedChanges only; `refresh()`/`commit()`
 
 - Strict clippy lints: `unwrap_used` is NOT denied (unlike pbfhogg), but several style and correctness lints are deny-level. See `[lints.clippy]` in Cargo.toml.
 - No test suite. Manual TUI testing only (requires root + apt packages).
-- Single-threaded — no async, no threading. rust-apt types are not Send.
+- Single-threaded - no async, no threading. rust-apt types are not Send.
 - `PackageId` is an opaque handle valid for one cache generation. Maps to full package names (including arch, e.g., "libfoo:amd64").
 
 ## Key dependencies
 
-- **rust-apt 0.9** — APT cache bindings (main FFI dependency)
-- **ratatui 0.30** — TUI rendering
-- **crossterm 0.28** — terminal I/O
-- **rusqlite 0.39 (bundled)** — SQLite FTS5 search index
-- **hotpath 0.14** — function-level profiling
+- **rust-apt 0.9** - APT cache bindings (main FFI dependency)
+- **ratatui 0.30** - TUI rendering
+- **crossterm 0.28** - terminal I/O
+- **rusqlite 0.39 (bundled)** - SQLite FTS5 search index
+- **hotpath 0.14** - function-level profiling
 
 ## Performance notes
 

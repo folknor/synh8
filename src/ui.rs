@@ -246,7 +246,7 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let list = app.core.list();
     let total_count = list.len();
 
-    // Compute visible window — use for both slicing and scroll feedback.
+    // Compute visible window - use for both slicing and scroll feedback.
     // area.height minus 2 (borders) minus 1 (header row).
     let visible_rows = area.height.saturating_sub(3) as usize;
     app.ui.table_visible_rows = visible_rows;

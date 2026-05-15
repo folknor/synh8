@@ -332,7 +332,7 @@ pub enum MarkPreview {
         /// Empty for single-package toggles. Used by cancel_mark() for reversal.
         bulk_acted_ids: Vec<PackageId>,
     },
-    /// Unmarking package(s) — reverting a previous mark
+    /// Unmarking package(s) - reverting a previous mark
     Unmark {
         package_name: String,
         /// Was the original package user-marked (vs a dependency)?
