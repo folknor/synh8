@@ -8,14 +8,25 @@ Synaptic-inspired TUI for managing APT packages on Debian/Ubuntu. Rust + ratatui
 - Never chain commands with ;
 - Never pipe commands with |
 - Never read or write from /tmp
+- Never run raw `cargo`. Use `brokkr`.
+
+## git commit rules
+- Always run `brokkr fmt` before a commit.
+- Never commit markdown changes alone. Bundle them with upcoming code commits.
+- When committing other changes: always tag along markdown files if dirty.
+- Write substantive engineering-focused commit messages.
+- Has `Cargo.lock` changed? Commit it.
+- Never `git push` unless the user explicitly asks. Stop after the commit.
+- Remember to update CHANGELOG.md for relevant commits (but not general small performance improvements.)
 
 ## Build
 
-Requires `libapt-pkg-dev`. Linux-only.
+Requires `libapt-pkg-dev`. Linux-only. Use `brokkr` (not raw `cargo`).
 
 ```bash
 sudo apt install libapt-pkg-dev
-cargo build --release
+brokkr check       # gremlins + clippy + tests. Replaces build/test/clippy
+brokkr fmt         # format
 ```
 
 Must run as root:
@@ -29,7 +40,7 @@ sudo ./target/release/synh8
 - `hotpath-alloc` - allocation tracking
 
 ```bash
-cargo build --release --features hotpath
+brokkr check --features hotpath
 sudo ./target/release/synh8
 # Report prints to stderr on exit
 ```
@@ -107,3 +118,37 @@ The dominant cost in this codebase is rust-apt FFI property extraction when iter
 - `depcache().clear_marked()` replaced per-package mark_keep loop: 401ms → 114ms.
 - Filter cache eliminates FFI on repeated filter switches: ~25ms cache hit vs ~450ms cold miss.
 - Windowed rendering: ~300µs per frame regardless of list size.
+
+## Document folders
+
+The standing layout, across every project. Three live folders plus one retired,
+split by durability first, subject second.
+
+| Folder | Contents | Rule |
+|---|---|---|
+| `reference/` | Durable in-repo reference for anyone working on or with the code - how the thing is built and why: `architecture.md`, `technical-implementation-spec.md`, `performance.md` (the durable record of measured numbers over time), invariants, protocol contracts | Citable from source as a source of truth. What it says must be true. |
+| `docs/` | Durable in-repo documentation of how the thing is used - guides, CLI reference, the consumer-facing API surface. Sometimes exposed as a hand-edited VitePress gh-pages site | Same must-be-true rule. |
+| `notes/` | Transient - work items (`todo.md`), future plans, hypotheticals, bug reports, research, analysis. Things that will die | No truth guarantee. Nothing durable cites it. |
+| `plans/` | Retired | Plan documents are transient: they go in `notes/`. |
+
+`reference/` and `docs/` are both durable and both binding. The difference is
+subject, not audience: `reference/` covers how the thing is built and why - what
+you need in order to change it safely - while `docs/` covers how it is used. A
+developer or library consumer reads both. Where a project publishes a site,
+`docs/` is what gets published; the folder means the same thing either way.
+`notes/` is neither durable nor binding, which is the whole point of keeping it
+separate: a document that may be wrong must not sit where a document that must
+be right is expected.
+
+The dependency direction is therefore one-way. `notes/` may cite `docs/` and
+`reference/`; nothing durable may cite `notes/` - not a code comment, not
+`docs/`, not `reference/`. A code comment must carry its full context, because
+it outlives the note.
+
+**Root-level convention files are exempt.** `AGENTS.md`, `CLAUDE.md`,
+`README.md`, `LICENSE`, `CHANGELOG.md` and their kin are found by tooling and by
+convention at the repository root, and stay there. These folders govern
+documents we chose where to put, not files whose location is dictated.
+
+In `notes/`, `docs/` and `reference/` alike, avoid citing source line numbers -
+they drift fast.
