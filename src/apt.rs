@@ -4,6 +4,8 @@
 //! User intent tracking is handled by the core module, not here.
 
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
 use color_eyre::Result;
 use rust_apt::cache::{Cache, PackageSort};
@@ -320,6 +322,7 @@ impl AptCache {
         acquire_progress: &mut AcquireProgress,
         install_progress: &mut InstallProgress,
     ) -> Result<()> {
+        ensure_archive_dirs()?;
         let cache = std::mem::replace(&mut self.cache, Cache::new::<&str>(&[])?);
         cache.commit(acquire_progress, install_progress)?;
         Ok(())
@@ -336,6 +339,35 @@ impl AptCache {
         self.cache = Cache::new::<&str>(&[])?;
         Ok(())
     }
+}
+
+/// Recreate `Dir::Cache::Archives` and its `partial/` subdirectory if missing.
+///
+/// apt-get runs libapt's `SetupAPTPartialDirectory()` (via `pkgAcquire::GetLock`)
+/// before every fetch, so a wiped /var/cache/apt is silently rebuilt there.
+/// rust-apt's `commit()` constructs a bare `pkgAcquire` and skips that step,
+/// so without this guard every download item fails immediately when the user
+/// has deleted the cache directory between runs. Matches apt's layout:
+/// `partial/` is 0700 and owned by `_apt`, since the sandboxed download
+/// methods drop privileges before writing into it.
+fn ensure_archive_dirs() -> Result<()> {
+    let config = rust_apt::config::Config::new();
+    let archive_dir = config.dir("Dir::Cache::Archives", "/var/cache/apt/archives/");
+    let partial = Path::new(&archive_dir).join("partial");
+    if partial.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&partial)?;
+    std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o700))?;
+    // Best effort, like apt: if the _apt user is missing, apt warns and
+    // downloads as root instead of failing, and so do we.
+    drop(
+        std::process::Command::new("chown")
+            .arg("_apt:root")
+            .arg(&partial)
+            .status(),
+    );
+    Ok(())
 }
 
 /// Helper function to order dependency types by priority

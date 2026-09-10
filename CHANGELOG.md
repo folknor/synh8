@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Recreate `/var/cache/apt/archives/partial` before committing changes: rust-apt's
+  fetcher (unlike apt-get) does not rebuild the archive directories if they've been
+  deleted, so installs failed after wiping /var/cache/apt to reclaim space
 - Bump rust-apt 0.10 -> 0.11.2: `commit()` now releases the APT lock on failure and
   returns an error instead of panicking when an install fails mid-transaction
 - Better resolver error messages: errors are now separated from warnings (a stray APT
