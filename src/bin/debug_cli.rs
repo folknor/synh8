@@ -3,7 +3,7 @@
 //! This CLI tests the exact user flow from docs/user-flow.md
 //!
 //! Usage:
-//!   cargo run --bin debug_cli -- <command> [args]
+//!   cargo run --bin debug-cli -- <command> [args]
 //!
 //! Commands:
 //!   status              Show current state and all marked packages
@@ -32,20 +32,26 @@ fn main() -> Result<()> {
     match cmd {
         "status" => cmd_status()?,
         "info" => {
-            let name = args.get(2).ok_or_else(|| color_eyre::eyre::eyre!("Usage: info <package_name>"))?;
+            let name = args
+                .get(2)
+                .ok_or_else(|| color_eyre::eyre::eyre!("Usage: info <package_name>"))?;
             cmd_info(name)?;
         }
         "toggle" => {
-            let name = args.get(2).ok_or_else(|| color_eyre::eyre::eyre!("Usage: toggle <package_name>"))?;
+            let name = args
+                .get(2)
+                .ok_or_else(|| color_eyre::eyre::eyre!("Usage: toggle <package_name>"))?;
             cmd_toggle(name)?;
         }
         "reset" => cmd_reset()?,
         "list" => cmd_list(args.get(2).map(String::as_str))?,
         "deps" => {
-            let name = args.get(2).ok_or_else(|| color_eyre::eyre::eyre!("Usage: deps <package_name>"))?;
+            let name = args
+                .get(2)
+                .ok_or_else(|| color_eyre::eyre::eyre!("Usage: deps <package_name>"))?;
             cmd_deps(name)?;
         }
-        "help" | _ => {
+        _ => {
             println!("Debug CLI for synh8 package manager");
             println!();
             println!("Commands:");
@@ -74,7 +80,9 @@ fn cmd_status() -> Result<()> {
     println!();
 
     // Count marked packages
-    let marked: Vec<_> = state.list().iter()
+    let marked: Vec<_> = state
+        .list()
+        .iter()
         .filter(|p| p.status.is_marked())
         .collect();
 
@@ -96,16 +104,14 @@ fn cmd_status() -> Result<()> {
 fn cmd_info(name: &str) -> Result<()> {
     let state = load_state()?;
 
-    let pkg = state.list().iter()
-        .find(|p| p.name == name)
-        .cloned();
+    let pkg = state.list().iter().find(|p| p.name == name).cloned();
 
     match pkg {
         Some(p) => {
             println!("{}: {}", p.name, status_display(p.status));
         }
         None => {
-            println!("Package '{}' not found", name);
+            println!("Package '{name}' not found");
         }
     }
 
@@ -116,14 +122,12 @@ fn cmd_toggle(name: &str) -> Result<()> {
     let mut state = load_state()?;
 
     // Find the package
-    let pkg = state.list().iter()
-        .find(|p| p.name == name)
-        .cloned();
+    let pkg = state.list().iter().find(|p| p.name == name).cloned();
 
     let pkg = match pkg {
         Some(p) => p,
         None => {
-            println!("Package '{}' not found", name);
+            println!("Package '{name}' not found");
             return Ok(());
         }
     };
@@ -135,36 +139,42 @@ fn cmd_toggle(name: &str) -> Result<()> {
     let cache = state.cache();
 
     match &result {
-        ToggleResult::Marked { package, additional } => {
+        ToggleResult::Marked {
+            package,
+            additional,
+        } => {
             let pkg_name = cache.fullname_of(*package).unwrap_or("(unknown)");
-            println!("=== Toggle {} (mark) ===", pkg_name);
-            println!("Marked: {}", pkg_name);
+            println!("=== Toggle {pkg_name} (mark) ===");
+            println!("Marked: {pkg_name}");
 
             if !additional.is_empty() {
                 println!("Also marked ({} deps):", additional.len());
                 for dep_id in additional {
                     let dep_name = cache.fullname_of(*dep_id).unwrap_or("(unknown)");
-                    println!("  ↑ {}", dep_name);
+                    println!("  ↑ {dep_name}");
                 }
             }
         }
-        ToggleResult::Unmarked { package, also_unmarked } => {
+        ToggleResult::Unmarked {
+            package,
+            also_unmarked,
+        } => {
             let pkg_name = cache.fullname_of(*package).unwrap_or("(unknown)");
-            println!("=== Toggle {} (unmark) ===", pkg_name);
-            println!("Unmarked: {}", pkg_name);
+            println!("=== Toggle {pkg_name} (unmark) ===");
+            println!("Unmarked: {pkg_name}");
 
             if !also_unmarked.is_empty() {
                 println!("Also unmarked ({}):", also_unmarked.len());
                 for dep_id in also_unmarked {
                     let dep_name = cache.fullname_of(*dep_id).unwrap_or("(unknown)");
-                    println!("  {}", dep_name);
+                    println!("  {dep_name}");
                 }
             }
         }
         ToggleResult::NoChange { package } => {
             let pkg_name = cache.fullname_of(*package).unwrap_or("(unknown)");
-            println!("=== Toggle {} (no change) ===", pkg_name);
-            println!("{} is a dependency - unmark the package that requires it", pkg_name);
+            println!("=== Toggle {pkg_name} (no change) ===");
+            println!("{pkg_name} is a dependency - unmark the package that requires it");
         }
     }
 
@@ -192,7 +202,7 @@ fn cmd_list(filter: Option<&str>) -> Result<()> {
         Some("marked") => FilterCategory::MarkedChanges,
         Some("all") => FilterCategory::All,
         Some(f) => {
-            println!("Unknown filter: {}. Using 'upgradable'", f);
+            println!("Unknown filter: {f}. Using 'upgradable'");
             FilterCategory::Upgradable
         }
     };
@@ -219,9 +229,9 @@ fn cmd_deps(name: &str) -> Result<()> {
     let state = load_state()?;
     let deps = state.get_dependencies(name);
 
-    println!("Dependencies for {}:", name);
+    println!("Dependencies for {name}:");
     for (dep_type, dep_name) in deps {
-        println!("  {} {}", dep_type, dep_name);
+        println!("  {dep_type} {dep_name}");
     }
 
     Ok(())
@@ -277,7 +287,8 @@ fn load_state() -> Result<ManagerState> {
 
 fn save_state(state: &ManagerState) -> Result<()> {
     // Save only user_intent packages (not dependencies)
-    let user_marked: Vec<String> = state.list()
+    let user_marked: Vec<String> = state
+        .list()
         .iter()
         .filter(|p| state.is_user_marked(p.id))
         .map(|p| p.name.clone())

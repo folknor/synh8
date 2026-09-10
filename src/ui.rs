@@ -2,8 +2,8 @@
 
 use ratatui::prelude::*;
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
+    Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Table, TableState, Wrap,
 };
 
 use crate::app::App;
@@ -31,18 +31,22 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             PackageInfo::size_str(download_size)
         )
     } else if app.core.has_marks() {
-        format!(" APT TUI │ {} marked (press 'a' to apply) ",
-            app.core.user_mark_count())
+        format!(
+            " APT TUI │ {} marked (press 'a' to apply) ",
+            app.core.user_mark_count()
+        )
     } else {
         " APT TUI │ No changes pending ".to_string()
     };
-    let title = Paragraph::new(title_text)
-        .style(Style::default().fg(Color::White).bg(Color::Blue).bold());
+    let title =
+        Paragraph::new(title_text).style(Style::default().fg(Color::White).bg(Color::Blue).bold());
     frame.render_widget(title, main_chunks[0]);
 
     match app.state {
-        AppState::Listing | AppState::Searching
-        | AppState::ShowingMarkConfirm | AppState::ConfirmExit => {
+        AppState::Listing
+        | AppState::Searching
+        | AppState::ShowingMarkConfirm
+        | AppState::ConfirmExit => {
             // Three-pane base layout (shared by listing and its modal overlays)
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
@@ -59,7 +63,9 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
 
             // Modal overlays on top of three-pane layout
             match app.state {
-                AppState::ShowingMarkConfirm => render_mark_preview_modal(frame, app, main_chunks[1]),
+                AppState::ShowingMarkConfirm => {
+                    render_mark_preview_modal(frame, app, main_chunks[1]);
+                }
                 AppState::ConfirmExit => render_exit_confirm_modal(frame, app, main_chunks[1]),
                 _ => {}
             }
@@ -74,13 +80,18 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             render_settings_view(frame, app, main_chunks[1]);
         }
         AppState::Upgrading | AppState::Done => {
-            let lines: Vec<Line> = app.output_lines
+            let lines: Vec<Line> = app
+                .output_lines
                 .iter()
                 .map(|s| Line::from(s.as_str()))
                 .collect();
             let output = Paragraph::new(lines)
-                .block(Block::default().title(" APT Output ").borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Green)))
+                .block(
+                    Block::default()
+                        .title(" APT Output ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Green)),
+                )
                 .wrap(Wrap { trim: false })
                 .scroll((app.output_scroll, 0));
             frame.render_widget(output, main_chunks[1]);
@@ -103,7 +114,12 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         AppState::Searching => format!("/{}_", app.core.search_query()).into(),
         _ => {
             if app.core.search_result_count().is_some() {
-                format!("[Search: {}] {}", app.core.search_query(), app.status_message).into()
+                format!(
+                    "[Search: {}] {}",
+                    app.core.search_query(),
+                    app.status_message
+                )
+                .into()
             } else {
                 (&*app.status_message).into()
             }
@@ -139,14 +155,11 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     frame.render_widget(help, main_chunks[3]);
 
     // Show cursor for text input states
-    match app.state {
-        AppState::Searching => {
-            // Cursor after "/<query>" in the status bar (inside border: +1 x, +1 y)
-            let cursor_x = main_chunks[2].x + 1 + 1 + app.core.search_query().len() as u16;
-            let cursor_y = main_chunks[2].y + 1;
-            frame.set_cursor_position((cursor_x, cursor_y));
-        }
-        _ => {}
+    if app.state == AppState::Searching {
+        // Cursor after "/<query>" in the status bar (inside border: +1 x, +1 y)
+        let cursor_x = main_chunks[2].x + 1 + 1 + app.core.search_query().len() as u16;
+        let cursor_y = main_chunks[2].y + 1;
+        frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
 
@@ -221,13 +234,12 @@ fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
         ]),
     ];
 
-    let legend_widget = Paragraph::new(legend)
-        .block(
-            Block::default()
-                .title(" Legend ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        );
+    let legend_widget = Paragraph::new(legend).block(
+        Block::default()
+            .title(" Legend ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
 
     frame.render_widget(legend_widget, chunks[1]);
 }
@@ -256,7 +268,10 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let offset = if total_count == 0 {
         0
     } else {
-        app.ui.table_state.offset().min(total_count.saturating_sub(1))
+        app.ui
+            .table_state
+            .offset()
+            .min(total_count.saturating_sub(1))
     };
     let end = (offset + visible_rows).min(total_count);
     let visible_slice = &list[offset..end];
@@ -267,7 +282,9 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .enumerate()
         .map(|(local_idx, pkg)| {
             let abs_idx = offset + local_idx;
-            let is_multi_selected = app.ui.visual_range
+            let is_multi_selected = app
+                .ui
+                .visual_range
                 .is_some_and(|(start, end)| abs_idx >= start && abs_idx <= end);
             let is_user_marked = app.core.is_user_marked(pkg.id);
 
@@ -309,7 +326,10 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    let widths: Vec<Constraint> = visible_cols.iter().map(|col| col.width(&app.col_widths)).collect();
+    let widths: Vec<Constraint> = visible_cols
+        .iter()
+        .map(|col| col.width(&app.col_widths))
+        .collect();
 
     let border_style = if is_focused {
         Style::default().fg(Color::Cyan)
@@ -348,8 +368,8 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
             .begin_symbol(Some("↑"))
             .end_symbol(Some("↓"));
 
-        let mut scrollbar_state = ScrollbarState::new(total_count)
-            .position(app.ui.table_state.selected().unwrap_or(0));
+        let mut scrollbar_state =
+            ScrollbarState::new(total_count).position(app.ui.table_state.selected().unwrap_or(0));
 
         let scrollbar_area = Rect {
             x: area.x + area.width - 1,
@@ -394,7 +414,10 @@ fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" "),
             Span::styled("[RDeps]", rdeps_style),
         ]),
-        Line::from(Span::styled("  (d to switch)", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(
+            "  (d to switch)",
+            Style::default().fg(Color::DarkGray),
+        )),
         Line::from(""),
     ];
 
@@ -487,7 +510,10 @@ fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
                     )));
                 } else {
                     content.push(Line::from(Span::styled(
-                        format!("{} packages depend on this:", app.details.cached_rdeps.len()),
+                        format!(
+                            "{} packages depend on this:",
+                            app.details.cached_rdeps.len()
+                        ),
                         Style::default().fg(Color::Cyan).bold(),
                     )));
                     content.push(Line::from(""));
@@ -563,28 +589,39 @@ fn render_changes_modal(frame: &mut Frame, app: &mut App, area: Rect) {
 
         // Helper to get display name from PackageId (strips native arch suffix)
         let get_name = |c: &PlannedChange| -> String {
-            cache.fullname_of(c.package)
+            cache
+                .fullname_of(c.package)
                 .map(|name| cache.display_name(name).to_string())
                 .unwrap_or_else(|| format!("(unknown:{})", c.package.index()))
         };
 
         // Group by action and reason
-        let user_upgrades: Vec<_> = changes.iter()
-            .filter(|c| c.action == ChangeAction::Upgrade && c.reason == ChangeReason::UserRequested)
+        let user_upgrades: Vec<_> = changes
+            .iter()
+            .filter(|c| {
+                c.action == ChangeAction::Upgrade && c.reason == ChangeReason::UserRequested
+            })
             .collect();
-        let user_installs: Vec<_> = changes.iter()
-            .filter(|c| c.action == ChangeAction::Install && c.reason == ChangeReason::UserRequested)
+        let user_installs: Vec<_> = changes
+            .iter()
+            .filter(|c| {
+                c.action == ChangeAction::Install && c.reason == ChangeReason::UserRequested
+            })
             .collect();
-        let dep_upgrades: Vec<_> = changes.iter()
+        let dep_upgrades: Vec<_> = changes
+            .iter()
             .filter(|c| c.action == ChangeAction::Upgrade && c.reason == ChangeReason::Dependency)
             .collect();
-        let dep_installs: Vec<_> = changes.iter()
+        let dep_installs: Vec<_> = changes
+            .iter()
             .filter(|c| c.action == ChangeAction::Install && c.reason == ChangeReason::Dependency)
             .collect();
-        let user_removes: Vec<_> = changes.iter()
+        let user_removes: Vec<_> = changes
+            .iter()
             .filter(|c| c.action == ChangeAction::Remove && c.reason == ChangeReason::UserRequested)
             .collect();
-        let auto_removes: Vec<_> = changes.iter()
+        let auto_removes: Vec<_> = changes
+            .iter()
             .filter(|c| c.action == ChangeAction::Remove && c.reason == ChangeReason::AutoRemove)
             .collect();
 
@@ -694,7 +731,8 @@ fn render_changelog_view(frame: &mut Frame, app: &mut App, area: Rect) {
         .unwrap_or_else(|| "Unknown".to_string());
 
     let lines: Vec<Line> = app
-        .modals.changelog_content
+        .modals
+        .changelog_content
         .iter()
         .map(|s| Line::from(s.as_str()))
         .collect();
@@ -739,23 +777,28 @@ fn render_settings_view(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         Style::default()
     };
-    items.push(ListItem::new(format!("Sort by: {}", app.settings.sort_by.label())).style(sort_style));
+    items.push(
+        ListItem::new(format!("Sort by: {}", app.settings.sort_by.label())).style(sort_style),
+    );
 
     let order_style = if app.settings_selection == col_count + 1 {
         Style::default().bg(Color::DarkGray)
     } else {
         Style::default()
     };
-    let order = if app.settings.sort_ascending { "Ascending" } else { "Descending" };
+    let order = if app.settings.sort_ascending {
+        "Ascending"
+    } else {
+        "Descending"
+    };
     items.push(ListItem::new(format!("Sort order: {order}")).style(order_style));
 
-    let settings_list = List::new(items)
-        .block(
-            Block::default()
-                .title(" Settings ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
-        );
+    let settings_list = List::new(items).block(
+        Block::default()
+            .title(" Settings ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
 
     frame.render_widget(settings_list, area);
 }
@@ -776,19 +819,30 @@ fn render_mark_preview_modal(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::new();
 
     let title = match preview {
-        MarkPreview::Mark { package_name, is_upgrade, additional_installs, additional_upgrades, additional_removes, download_size, bulk_acted_ids } => {
+        MarkPreview::Mark {
+            package_name,
+            is_upgrade,
+            additional_installs,
+            additional_upgrades,
+            additional_removes,
+            download_size,
+            bulk_acted_ids,
+        } => {
             let header = if bulk_acted_ids.len() > 1 {
-                format!("Mark {} for install/upgrade?", package_name)
+                format!("Mark {package_name} for install/upgrade?")
             } else {
                 let action = if *is_upgrade { "upgrade" } else { "install" };
-                format!("Mark '{}' for {}?", package_name, action)
+                format!("Mark '{package_name}' for {action}?")
             };
             lines.push(Line::from(Span::styled(header, Style::default().bold())));
             lines.push(Line::from(""));
 
             if !additional_installs.is_empty() {
                 lines.push(Line::from(Span::styled(
-                    format!("Will install {} additional packages:", additional_installs.len()),
+                    format!(
+                        "Will install {} additional packages:",
+                        additional_installs.len()
+                    ),
                     Style::default().fg(Color::Green),
                 )));
                 for name in additional_installs {
@@ -826,11 +880,16 @@ fn render_mark_preview_modal(frame: &mut Frame, app: &App, area: Rect) {
 
             " Confirm Package Mark "
         }
-        MarkPreview::Unmark { package_name, also_unmarked, bulk_acted_ids, .. } => {
+        MarkPreview::Unmark {
+            package_name,
+            also_unmarked,
+            bulk_acted_ids,
+            ..
+        } => {
             let header = if bulk_acted_ids.len() > 1 {
-                format!("Unmark {}?", package_name)
+                format!("Unmark {package_name}?")
             } else {
-                format!("Unmark '{}'?", package_name)
+                format!("Unmark '{package_name}'?")
             };
             lines.push(Line::from(Span::styled(header, Style::default().bold())));
             lines.push(Line::from(""));
@@ -850,10 +909,7 @@ fn render_mark_preview_modal(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     // Apply scroll offset
-    let visible_lines: Vec<Line> = lines
-        .into_iter()
-        .skip(app.mark_preview_scroll)
-        .collect();
+    let visible_lines: Vec<Line> = lines.into_iter().skip(app.mark_preview_scroll).collect();
 
     let modal = Paragraph::new(visible_lines)
         .block(
@@ -916,4 +972,3 @@ fn render_exit_confirm_modal(frame: &mut Frame, _app: &App, area: Rect) {
 
     frame.render_widget(modal, modal_area);
 }
-

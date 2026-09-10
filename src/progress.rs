@@ -11,9 +11,9 @@ use std::cell::RefCell;
 use std::fs::File;
 use std::rc::Rc;
 
+use ratatui::Terminal;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
-use ratatui::Terminal;
 use rust_apt::raw::{AcqTextStatus, ItemDesc, PkgAcquire};
 
 use crate::types::PackageInfo;
@@ -77,14 +77,20 @@ impl StdioRedirect {
             }
             // file drops here closing capture_fd, but the dup'd fds keep it open
 
-            Ok(Self { saved_stdout, saved_stderr, capture_path })
+            Ok(Self {
+                saved_stdout,
+                saved_stderr,
+                capture_path,
+            })
         }
     }
 
     /// Read the captured output.
     pub fn output(&self) -> Vec<String> {
         // Flush C stdio buffers so all libapt output is written to the file
-        unsafe { libc::fflush(std::ptr::null_mut()); }
+        unsafe {
+            libc::fflush(std::ptr::null_mut());
+        }
         std::fs::read_to_string(&self.capture_path)
             .unwrap_or_default()
             .lines()
@@ -146,9 +152,7 @@ pub struct ProgressState {
 
 impl ProgressState {
     pub fn new(title: &str) -> std::io::Result<Self> {
-        let tty = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/tty")?;
+        let tty = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
         let backend = CrosstermBackend::new(tty);
         let terminal = Terminal::new(backend)?;
         Ok(Self {
@@ -180,9 +184,9 @@ impl ProgressState {
             title: &self.title,
         };
 
-        let _ = self.terminal.draw(|frame| {
+        drop(self.terminal.draw(|frame| {
             render_progress_modal(frame, &snap);
-        });
+        }));
     }
 }
 
@@ -216,7 +220,9 @@ impl rust_apt::progress::DynAcquireProgress for TuiAcquireProgress {
         let error_text = owner.error_text();
         if !error_text.is_empty() {
             let mut state = self.state.borrow_mut();
-            state.errors.push(format!("{}: {error_text}", item.short_desc()));
+            state
+                .errors
+                .push(format!("{}: {error_text}", item.short_desc()));
             state.draw();
         }
     }
@@ -359,7 +365,10 @@ fn render_progress_modal(frame: &mut Frame, snap: &ProgressSnapshot) {
             };
             let status = Line::from(vec![
                 Span::styled("Downloading... ", Style::default().fg(Color::Cyan)),
-                Span::styled(format!("{percent:.0}%"), Style::default().fg(Color::White).bold()),
+                Span::styled(
+                    format!("{percent:.0}%"),
+                    Style::default().fg(Color::White).bold(),
+                ),
                 Span::styled(speed_str, Style::default().fg(Color::DarkGray)),
             ]);
             frame.render_widget(Paragraph::new(status), chunks[1]);
@@ -434,8 +443,7 @@ fn render_progress_modal(frame: &mut Frame, snap: &ProgressSnapshot) {
             .rev()
             .map(|e| Line::from(Span::styled(e.as_str(), Style::default().fg(Color::Red))))
             .collect();
-        let error_para = Paragraph::new(error_lines)
-            .wrap(Wrap { trim: false });
+        let error_para = Paragraph::new(error_lines).wrap(Wrap { trim: false });
         frame.render_widget(error_para, chunks[7]);
     }
 }

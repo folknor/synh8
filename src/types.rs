@@ -96,16 +96,16 @@ impl ReadableState for Planned {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageStatus {
     // Base states (not marked)
-    Installed,        // · Package is installed, no changes pending
-    NotInstalled,     //   Package is not installed, no changes pending
-    Upgradable,       // ↑ Package can be upgraded (yellow)
+    Installed,    // · Package is installed, no changes pending
+    NotInstalled, //   Package is not installed, no changes pending
+    Upgradable,   // ↑ Package can be upgraded (yellow)
     // Marked states (all marked packages look identical)
     MarkedForInstall, // + Package will be installed
     MarkedForUpgrade, // ↑ Package will be upgraded (green)
     MarkedForRemove,  // - Package will be removed
     // Other
-    Keep,             // = Package kept at current version
-    Broken,           // ✗ Package is broken
+    Keep,   // = Package kept at current version
+    Broken, // ✗ Package is broken
 }
 
 impl PackageStatus {
@@ -136,10 +136,9 @@ impl PackageStatus {
 
     /// Check if this status represents a marked (pending change) state
     pub fn is_marked(&self) -> bool {
-        matches!(self,
-            Self::MarkedForInstall |
-            Self::MarkedForUpgrade |
-            Self::MarkedForRemove
+        matches!(
+            self,
+            Self::MarkedForInstall | Self::MarkedForUpgrade | Self::MarkedForRemove
         )
     }
 }
@@ -180,8 +179,8 @@ impl FilterCategory {
 /// The package is identified by `id` (PackageId). Name is derived, not stored separately.
 #[derive(Debug, Clone)]
 pub struct PackageInfo {
-    pub id: PackageId,        // Stable handle for this package - the ONLY identifier
-    pub name: String,         // Full name including arch (e.g., "libfoo:i386") - for display/sort
+    pub id: PackageId, // Stable handle for this package - the ONLY identifier
+    pub name: String,  // Full name including arch (e.g., "libfoo:i386") - for display/sort
     pub status: PackageStatus,
     pub section: String,
     pub installed_version: String,
@@ -271,7 +270,12 @@ impl SortBy {
     }
 
     pub fn all() -> &'static [SortBy] {
-        &[Self::Name, Self::Section, Self::InstalledVersion, Self::CandidateVersion]
+        &[
+            Self::Name,
+            Self::Section,
+            Self::InstalledVersion,
+            Self::CandidateVersion,
+        ]
     }
 }
 
@@ -311,9 +315,7 @@ pub enum ToggleResult {
         also_unmarked: Vec<PackageId>,
     },
     /// Toggle had no effect (e.g., dependency with untraceable origin)
-    NoChange {
-        package: PackageId,
-    },
+    NoChange { package: PackageId },
 }
 
 /// Preview of changes when marking or unmarking a package (or bulk selection).
@@ -430,5 +432,10 @@ impl ColumnWidths {
             candidate: 9,
         }
     }
+}
 
+impl Default for ColumnWidths {
+    fn default() -> Self {
+        Self::new()
+    }
 }

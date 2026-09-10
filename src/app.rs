@@ -113,7 +113,8 @@ impl App {
         };
 
         // Sync sort settings from UI settings to core
-        app.core.set_sort(app.settings.sort_by, app.settings.sort_ascending);
+        app.core
+            .set_sort(app.settings.sort_by, app.settings.sort_ascending);
         app.refresh_ui_state();
         app.update_status_message();
         // Filter cache and search index are warmed incrementally via
@@ -149,7 +150,7 @@ impl App {
             true
         } else if step == filters.len() {
             // Build search index
-            let _ = self.core.ensure_search_index();
+            drop(self.core.ensure_search_index());
             self.warm_step = None;
             false
         } else {
@@ -178,11 +179,13 @@ impl App {
             .and_then(|name| self.core.list().iter().position(|p| p.name == name))
             .unwrap_or(0);
 
-        self.ui.table_state.select(if self.core.package_count() > 0 {
-            Some(new_idx)
-        } else {
-            None
-        });
+        self.ui
+            .table_state
+            .select(if self.core.package_count() > 0 {
+                Some(new_idx)
+            } else {
+                None
+            });
         self.center_scroll_offset();
     }
 
@@ -194,7 +197,8 @@ impl App {
     // === Accessors ===
 
     pub fn selected_package(&self) -> Option<&PackageInfo> {
-        self.ui.table_state
+        self.ui
+            .table_state
             .selected()
             .and_then(|i| self.core.get_package(i))
     }
@@ -216,7 +220,8 @@ impl App {
 
     #[hotpath::measure]
     pub fn update_cached_deps(&mut self) {
-        let pkg_name = self.selected_package()
+        let pkg_name = self
+            .selected_package()
             .map(|p| p.name.clone())
             .unwrap_or_default();
 
@@ -328,7 +333,9 @@ impl App {
 
         // Snapshot currently planned packages BEFORE the toggle so we can
         // show only the NEW dependencies in the confirmation modal
-        let previously_planned: HashSet<PackageId> = self.core.planned_changes()
+        let previously_planned: HashSet<PackageId> = self
+            .core
+            .planned_changes()
             .map(|changes| changes.iter().map(|c| c.package).collect())
             .unwrap_or_default();
 
@@ -336,7 +343,10 @@ impl App {
         let result = self.core.toggle(id);
 
         match result {
-            ToggleResult::Marked { package: _, additional } => {
+            ToggleResult::Marked {
+                package: _,
+                additional,
+            } => {
                 if additional.is_empty() {
                     // No additional deps, just update UI
                     self.refresh_ui_state();
@@ -347,8 +357,11 @@ impl App {
                     // (installs, removes). Pure upgrade deps are expected and don't
                     // need confirmation.
                     let needs_confirm = match &preview {
-                        Some(MarkPreview::Mark { additional_installs, additional_removes, .. }) =>
-                            !additional_installs.is_empty() || !additional_removes.is_empty(),
+                        Some(MarkPreview::Mark {
+                            additional_installs,
+                            additional_removes,
+                            ..
+                        }) => !additional_installs.is_empty() || !additional_removes.is_empty(),
                         _ => true,
                     };
                     if needs_confirm {
@@ -361,7 +374,10 @@ impl App {
                     }
                 }
             }
-            ToggleResult::Unmarked { package: _, also_unmarked } => {
+            ToggleResult::Unmarked {
+                package: _,
+                also_unmarked,
+            } => {
                 // Package was unmarked - check if cascade happened
                 if also_unmarked.is_empty() {
                     // No cascade, just update UI
@@ -370,8 +386,13 @@ impl App {
                 } else {
                     // Build preview showing what was unmarked (using display names)
                     let cache = self.core.cache();
-                    let also_names: Vec<String> = also_unmarked.iter()
-                        .filter_map(|id| cache.fullname_of(*id).map(|n| cache.display_name(n).to_string()))
+                    let also_names: Vec<String> = also_unmarked
+                        .iter()
+                        .filter_map(|id| {
+                            cache
+                                .fullname_of(*id)
+                                .map(|n| cache.display_name(n).to_string())
+                        })
                         .collect();
 
                     let preview = MarkPreview::Unmark {
@@ -388,9 +409,8 @@ impl App {
             ToggleResult::NoChange { package: _ } => {
                 // Couldn't unmark - it's a dependency we can't trace
                 // Tell user to unmark the original package instead
-                self.status_message = format!(
-                    "{pkg_name} is a dependency - unmark the package that requires it"
-                );
+                self.status_message =
+                    format!("{pkg_name} is a dependency - unmark the package that requires it");
                 self.refresh_ui_state();
             }
         }
@@ -420,7 +440,11 @@ impl App {
     pub fn cancel_mark(&mut self) {
         if let Some(ref preview) = self.mark_preview {
             match preview {
-                MarkPreview::Mark { package_name, bulk_acted_ids, .. } => {
+                MarkPreview::Mark {
+                    package_name,
+                    bulk_acted_ids,
+                    ..
+                } => {
                     if !bulk_acted_ids.is_empty() {
                         // Bulk cancel: reverse by ID directly
                         for &id in bulk_acted_ids {
@@ -435,7 +459,12 @@ impl App {
                         }
                     }
                 }
-                MarkPreview::Unmark { package_name, was_user_marked, also_unmarked, bulk_acted_ids } => {
+                MarkPreview::Unmark {
+                    package_name,
+                    was_user_marked,
+                    also_unmarked,
+                    bulk_acted_ids,
+                } => {
                     if !bulk_acted_ids.is_empty() {
                         // Bulk cancel: re-mark by ID directly
                         for &id in bulk_acted_ids {
@@ -451,7 +480,8 @@ impl App {
                             also_unmarked.clone()
                         };
 
-                        let ids_to_remark: Vec<_> = names_to_remark.iter()
+                        let ids_to_remark: Vec<_> = names_to_remark
+                            .iter()
                             .filter_map(|name| self.resolve_display_name_to_id(name))
                             .collect();
 
@@ -492,7 +522,8 @@ impl App {
             self.ui.visual_mode = true;
             self.ui.selection_anchor = Some(current_idx);
             self.ui.visual_range = Some((current_idx, current_idx));
-            self.status_message = "-- VISUAL -- (↑↓ to select, Space to mark, Esc to cancel)".to_string();
+            self.status_message =
+                "-- VISUAL -- (↑↓ to select, Space to mark, Esc to cancel)".to_string();
         } else {
             self.mark_selected_packages();
         }
@@ -536,7 +567,9 @@ impl App {
         };
 
         // Anchor row's state determines the operation for the entire selection
-        let anchor_is_marked = self.core.get_package(anchor_idx)
+        let anchor_is_marked = self
+            .core
+            .get_package(anchor_idx)
             .map(|p| p.status.is_marked())
             .unwrap_or(false);
 
@@ -559,17 +592,21 @@ impl App {
 
     fn bulk_mark(&mut self, selected_indices: &[usize]) {
         // Snapshot currently planned packages BEFORE any marks
-        let previously_planned: HashSet<PackageId> = self.core.planned_changes()
+        let previously_planned: HashSet<PackageId> = self
+            .core
+            .planned_changes()
             .map(|changes| changes.iter().map(|c| c.package).collect())
             .unwrap_or_default();
 
         // Filter to unmarked + (Upgradable | NotInstalled)
-        let ids_to_mark: Vec<PackageId> = selected_indices.iter()
+        let ids_to_mark: Vec<PackageId> = selected_indices
+            .iter()
             .filter_map(|&idx| self.core.get_package(idx))
-            .filter(|p| !p.status.is_marked() && (
-                p.status == PackageStatus::Upgradable
-                || p.status == PackageStatus::NotInstalled
-            ))
+            .filter(|p| {
+                !p.status.is_marked()
+                    && (p.status == PackageStatus::Upgradable
+                        || p.status == PackageStatus::NotInstalled)
+            })
             .map(|p| p.id)
             .collect();
 
@@ -607,13 +644,16 @@ impl App {
                     continue;
                 }
 
-                let name = cache.fullname_of(change.package)
+                let name = cache
+                    .fullname_of(change.package)
                     .map(|n| cache.display_name(n).to_string())
                     .unwrap_or_else(|| format!("(unknown:{})", change.package.index()));
 
                 match change.action {
                     ChangeAction::Install => additional_installs.push(name),
-                    ChangeAction::Upgrade | ChangeAction::Downgrade => additional_upgrades.push(name),
+                    ChangeAction::Upgrade | ChangeAction::Downgrade => {
+                        additional_upgrades.push(name);
+                    }
                     ChangeAction::Remove => additional_removes.push(name),
                 }
             }
@@ -621,8 +661,7 @@ impl App {
 
         // Only show confirmation for non-upgrade extras (installs, removes).
         // Pure upgrade deps are expected and don't need confirmation.
-        let needs_confirm = !additional_installs.is_empty()
-            || !additional_removes.is_empty();
+        let needs_confirm = !additional_installs.is_empty() || !additional_removes.is_empty();
 
         if !needs_confirm {
             self.refresh_ui_state();
@@ -631,7 +670,9 @@ impl App {
         }
 
         let summary_name = if ids_to_mark.len() == 1 {
-            self.core.cache().fullname_of(ids_to_mark[0])
+            self.core
+                .cache()
+                .fullname_of(ids_to_mark[0])
                 .map(|n| self.core.cache().display_name(n).to_string())
                 .unwrap_or_else(|| "1 package".to_string())
         } else {
@@ -653,13 +694,17 @@ impl App {
 
     fn bulk_unmark(&mut self, selected_indices: &[usize]) {
         // Snapshot all currently marked packages
-        let marked_before: HashSet<PackageId> = self.core.list().iter()
+        let marked_before: HashSet<PackageId> = self
+            .core
+            .list()
+            .iter()
             .filter(|p| p.status.is_marked())
             .map(|p| p.id)
             .collect();
 
         // Only unmark user-marked packages (deps vanish automatically via compute_plan)
-        let ids_to_unmark: Vec<PackageId> = selected_indices.iter()
+        let ids_to_unmark: Vec<PackageId> = selected_indices
+            .iter()
             .filter_map(|&idx| self.core.get_package(idx))
             .filter(|p| p.status.is_marked() && self.core.is_user_marked(p.id))
             .map(|p| p.id)
@@ -681,14 +726,22 @@ impl App {
         // Find cascade-unmarked packages (deps no longer needed)
         let unmarked_id_set: HashSet<PackageId> = ids_to_unmark.iter().copied().collect();
         let cascade_unmarked: Vec<String> = {
-            let marked_after: HashSet<PackageId> = self.core.list().iter()
+            let marked_after: HashSet<PackageId> = self
+                .core
+                .list()
+                .iter()
                 .filter(|p| p.status.is_marked())
                 .map(|p| p.id)
                 .collect();
             let cache = self.core.cache();
-            marked_before.iter()
+            marked_before
+                .iter()
                 .filter(|id| !marked_after.contains(id) && !unmarked_id_set.contains(id))
-                .filter_map(|id| cache.fullname_of(*id).map(|n| cache.display_name(n).to_string()))
+                .filter_map(|id| {
+                    cache
+                        .fullname_of(*id)
+                        .map(|n| cache.display_name(n).to_string())
+                })
                 .collect()
         };
 
@@ -699,7 +752,9 @@ impl App {
         }
 
         let summary_name = if ids_to_unmark.len() == 1 {
-            self.core.cache().fullname_of(ids_to_unmark[0])
+            self.core
+                .cache()
+                .fullname_of(ids_to_unmark[0])
                 .map(|n| self.core.cache().display_name(n).to_string())
                 .unwrap_or_else(|| "1 package".to_string())
         } else {
@@ -723,7 +778,8 @@ impl App {
             return;
         }
         let current = self.ui.table_state.selected().unwrap_or(0) as i64;
-        let new_idx = (current + delta as i64).clamp(0, self.core.package_count() as i64 - 1) as usize;
+        let new_idx =
+            (current + delta as i64).clamp(0, self.core.package_count() as i64 - 1) as usize;
         self.ui.table_state.select(Some(new_idx));
         self.center_scroll_offset();
         self.details.scroll = 0;
@@ -802,7 +858,9 @@ impl App {
         };
 
         self.modals.changelog_content.clear();
-        self.modals.changelog_content.push(format!("Loading changelog for {pkg_name}..."));
+        self.modals
+            .changelog_content
+            .push(format!("Loading changelog for {pkg_name}..."));
         self.modals.changelog_scroll = 0;
 
         match self.core.fetch_changelog(&pkg_name) {
@@ -833,13 +891,18 @@ impl App {
             }
         } else if self.settings_selection == col_count {
             let all = SortBy::all();
-            let idx = all.iter().position(|&s| s == self.settings.sort_by).unwrap_or(0);
+            let idx = all
+                .iter()
+                .position(|&s| s == self.settings.sort_by)
+                .unwrap_or(0);
             self.settings.sort_by = all[(idx + 1) % all.len()];
-            self.core.set_sort(self.settings.sort_by, self.settings.sort_ascending);
+            self.core
+                .set_sort(self.settings.sort_by, self.settings.sort_ascending);
             self.col_widths = self.core.rebuild_list();
         } else if self.settings_selection == col_count + 1 {
             self.settings.sort_ascending = !self.settings.sort_ascending;
-            self.core.set_sort(self.settings.sort_by, self.settings.sort_ascending);
+            self.core
+                .set_sort(self.settings.sort_by, self.settings.sort_ascending);
             self.col_widths = self.core.rebuild_list();
         }
     }
@@ -863,12 +926,14 @@ impl App {
 
     pub fn scroll_changelog(&mut self, delta: i32) {
         let max = self.modals.changelog_content.len().saturating_sub(1);
-        self.modals.changelog_scroll = clamped_scroll(self.modals.changelog_scroll.into(), delta, max) as u16;
+        self.modals.changelog_scroll =
+            clamped_scroll(self.modals.changelog_scroll.into(), delta, max) as u16;
     }
 
     pub fn scroll_changes(&mut self, delta: i32) {
         let max = self.changes_line_count().saturating_sub(5);
-        self.modals.changes_scroll = clamped_scroll(self.modals.changes_scroll.into(), delta, max) as u16;
+        self.modals.changes_scroll =
+            clamped_scroll(self.modals.changes_scroll.into(), delta, max) as u16;
     }
 
     pub fn scroll_mark_confirm(&mut self, delta: i32) {
@@ -888,12 +953,47 @@ impl App {
 
                 // Count changes grouped by action/reason category
                 let categories = [
-                    changes.iter().filter(|c| c.action == ChangeAction::Upgrade && c.reason == ChangeReason::UserRequested).count(),
-                    changes.iter().filter(|c| c.action == ChangeAction::Install && c.reason == ChangeReason::UserRequested).count(),
-                    changes.iter().filter(|c| c.action == ChangeAction::Upgrade && c.reason == ChangeReason::Dependency).count(),
-                    changes.iter().filter(|c| c.action == ChangeAction::Install && c.reason == ChangeReason::Dependency).count(),
-                    changes.iter().filter(|c| c.action == ChangeAction::Remove && c.reason == ChangeReason::UserRequested).count(),
-                    changes.iter().filter(|c| c.action == ChangeAction::Remove && c.reason == ChangeReason::AutoRemove).count(),
+                    changes
+                        .iter()
+                        .filter(|c| {
+                            c.action == ChangeAction::Upgrade
+                                && c.reason == ChangeReason::UserRequested
+                        })
+                        .count(),
+                    changes
+                        .iter()
+                        .filter(|c| {
+                            c.action == ChangeAction::Install
+                                && c.reason == ChangeReason::UserRequested
+                        })
+                        .count(),
+                    changes
+                        .iter()
+                        .filter(|c| {
+                            c.action == ChangeAction::Upgrade
+                                && c.reason == ChangeReason::Dependency
+                        })
+                        .count(),
+                    changes
+                        .iter()
+                        .filter(|c| {
+                            c.action == ChangeAction::Install
+                                && c.reason == ChangeReason::Dependency
+                        })
+                        .count(),
+                    changes
+                        .iter()
+                        .filter(|c| {
+                            c.action == ChangeAction::Remove
+                                && c.reason == ChangeReason::UserRequested
+                        })
+                        .count(),
+                    changes
+                        .iter()
+                        .filter(|c| {
+                            c.action == ChangeAction::Remove && c.reason == ChangeReason::AutoRemove
+                        })
+                        .count(),
                 ];
 
                 for count in categories {
@@ -911,7 +1011,12 @@ impl App {
 
     pub fn mark_confirm_line_count(&self) -> usize {
         match self.mark_preview {
-            Some(MarkPreview::Mark { ref additional_installs, ref additional_upgrades, ref additional_removes, .. }) => {
+            Some(MarkPreview::Mark {
+                ref additional_installs,
+                ref additional_upgrades,
+                ref additional_removes,
+                ..
+            }) => {
                 let mut count = 2; // Header lines
                 if !additional_installs.is_empty() {
                     count += 1 + additional_installs.len();
@@ -924,7 +1029,9 @@ impl App {
                 }
                 count + 2 // Footer lines
             }
-            Some(MarkPreview::Unmark { ref also_unmarked, .. }) => {
+            Some(MarkPreview::Unmark {
+                ref also_unmarked, ..
+            }) => {
                 let mut count = 2; // Header lines
                 if !also_unmarked.is_empty() {
                     count += 1 + also_unmarked.len();
@@ -967,9 +1074,7 @@ impl App {
 
         self.state = AppState::Upgrading;
 
-        let progress_state = Rc::new(RefCell::new(
-            ProgressState::new("Applying Changes")?,
-        ));
+        let progress_state = Rc::new(RefCell::new(ProgressState::new("Applying Changes")?));
 
         let acq = TuiAcquireProgress::new(Rc::clone(&progress_state));
         let inst = TuiInstallProgress::new(Rc::clone(&progress_state));
@@ -985,13 +1090,17 @@ impl App {
 
         // Suppress debconf prompts (use package defaults).
         // Safety: we're single-threaded, no concurrent env reads.
-        unsafe { std::env::set_var("DEBIAN_FRONTEND", "noninteractive"); }
+        unsafe {
+            std::env::set_var("DEBIAN_FRONTEND", "noninteractive");
+        }
 
         // Redirect stdout/stderr to a temp file so dpkg output is captured.
         // The progress terminal writes to /dev/tty directly, bypassing fd 1.
         let redirect = StdioRedirect::capture()?;
 
-        let result = self.core.commit_with_progress(&mut acquire_progress, &mut install_progress);
+        let result = self
+            .core
+            .commit_with_progress(&mut acquire_progress, &mut install_progress);
 
         // Read captured apt/dpkg output before restoring fds
         self.output_lines = redirect.output();
@@ -1000,7 +1109,8 @@ impl App {
         match result {
             Ok(()) => {
                 self.state = AppState::Done;
-                self.status_message = "Changes applied successfully. Space to continue.".to_string();
+                self.status_message =
+                    "Changes applied successfully. Space to continue.".to_string();
             }
             Err(e) => {
                 self.state = AppState::Done;
@@ -1024,9 +1134,7 @@ impl App {
             return Ok(());
         }
 
-        let progress_state = Rc::new(RefCell::new(
-            ProgressState::new("Updating Package Lists")?,
-        ));
+        let progress_state = Rc::new(RefCell::new(ProgressState::new("Updating Package Lists")?));
 
         let acq = TuiAcquireProgress::new(Rc::clone(&progress_state));
         let mut acquire_progress = rust_apt::progress::AcquireProgress::new(acq);

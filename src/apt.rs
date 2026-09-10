@@ -71,7 +71,9 @@ impl AptCache {
     /// "libfoo:amd64" -> "libfoo" (if amd64 is native)
     /// "libfoo:i386" -> "libfoo:i386" (keeps non-native arch)
     pub fn display_name<'a>(&self, fullname: &'a str) -> &'a str {
-        fullname.strip_suffix(&self.native_arch_suffix).unwrap_or(fullname)
+        fullname
+            .strip_suffix(&self.native_arch_suffix)
+            .unwrap_or(fullname)
     }
 
     // ========================================================================
@@ -97,12 +99,15 @@ impl AptCache {
 
     /// Get the full name for a PackageId
     pub fn fullname_of(&self, id: PackageId) -> Option<&str> {
-        self.id_to_fullname.get(id.index()).map(std::string::String::as_str)
+        self.id_to_fullname
+            .get(id.index())
+            .map(std::string::String::as_str)
     }
 
     /// Get a package by PackageId
     pub fn get_by_id(&self, id: PackageId) -> Option<Package<'_>> {
-        self.fullname_of(id).and_then(|fullname| self.cache.get(fullname))
+        self.fullname_of(id)
+            .and_then(|fullname| self.cache.get(fullname))
     }
 
     // ========================================================================
@@ -247,14 +252,15 @@ impl AptCache {
         };
 
         if let Some(version) = pkg.candidate()
-            && let Some(dependencies) = version.dependencies() {
-                for dep in dependencies {
-                    let dep_type = dep.dep_type().to_string();
-                    for base_dep in dep.iter() {
-                        deps.push((dep_type.clone(), base_dep.name().to_string()));
-                    }
+            && let Some(dependencies) = version.dependencies()
+        {
+            for dep in dependencies {
+                let dep_type = dep.dep_type().to_string();
+                for base_dep in dep.iter() {
+                    deps.push((dep_type.clone(), base_dep.name().to_string()));
                 }
             }
+        }
 
         deps.sort_by(|a, b| {
             dep_type_order(&a.0)
@@ -344,22 +350,33 @@ fn dep_type_order(t: &str) -> u8 {
     }
 }
 
-/// Format AptErrors into a user-friendly string with specific conflict details
+/// Format AptErrors into a user-friendly string with specific conflict details.
+/// Errors take priority over warnings: a real error is always the headline,
+/// and warnings only surface when APT produced no errors at all.
 pub fn format_apt_errors(errors: &AptErrors) -> String {
-    let mut messages = Vec::new();
+    let (mut errs, mut warns): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
 
     for error in errors.iter() {
-        let msg = error.to_string();
-        if !msg.is_empty() && msg != "E:" {
-            messages.push(msg);
+        let msg = error.msg.trim();
+        if msg.is_empty() {
+            continue;
+        }
+        if error.is_error {
+            errs.push(msg);
+        } else {
+            warns.push(msg);
         }
     }
 
-    if messages.is_empty() {
-        "Dependency resolution failed (no specific details available)".to_string()
-    } else if messages.len() == 1 {
-        messages[0].clone()
+    let (messages, label) = if errs.is_empty() {
+        (warns, "warning")
     } else {
-        format!("{}; and {} more issue(s)", messages[0], messages.len() - 1)
+        (errs, "issue")
+    };
+
+    match messages.len() {
+        0 => "Dependency resolution failed (no specific details available)".to_string(),
+        1 => messages[0].to_string(),
+        n => format!("{}; and {} more {}(s)", messages[0], n - 1, label),
     }
 }

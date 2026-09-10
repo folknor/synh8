@@ -4,8 +4,8 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use color_eyre::Result;
-use rust_apt::cache::PackageSort;
 use rusqlite::{Connection, params};
+use rust_apt::cache::PackageSort;
 
 use crate::apt::AptCache;
 
@@ -36,11 +36,14 @@ impl SearchIndex {
         self.conn.execute("DELETE FROM packages", [])?;
 
         // Insert all packages
-        let mut stmt = self.conn.prepare("INSERT INTO packages (name, description) VALUES (?, ?)")?;
+        let mut stmt = self
+            .conn
+            .prepare("INSERT INTO packages (name, description) VALUES (?, ?)")?;
 
         for pkg in apt.packages(&PackageSort::default()) {
             let name = pkg.name();
-            let desc = pkg.candidate()
+            let desc = pkg
+                .candidate()
                 .and_then(|c| c.summary())
                 .unwrap_or_default();
             stmt.execute(params![name, desc])?;
@@ -64,7 +67,8 @@ impl SearchIndex {
         let fts_query = query
             .split_whitespace()
             .map(|word| {
-                let cleaned: String = word.chars()
+                let cleaned: String = word
+                    .chars()
                     .filter(|c| !matches!(c, '"' | '*' | '^' | '(' | ')' | '{' | '}' | ':' | '+'))
                     .collect();
                 if cleaned.is_empty() {
@@ -77,9 +81,9 @@ impl SearchIndex {
             .collect::<Vec<_>>()
             .join(" ");
 
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT name FROM packages WHERE packages MATCH ?"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT name FROM packages WHERE packages MATCH ?")?;
 
         let rows = stmt.query_map([&fts_query], |row| row.get::<_, String>(0))?;
 

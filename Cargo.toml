@@ -7,19 +7,19 @@ license = "MIT"
 repository = "https://github.com/folknor/synh8"
 keywords = ["apt", "tui", "debian", "ubuntu", "package-manager"]
 categories = ["command-line-utilities"]
-rust-version = "1.96"
+rust-version = "1.99"
 exclude = ["CLAUDE.md", "TODO.md"]
 
 [dependencies]
 ratatui = "0.30.2"
 crossterm = "0.29"
 color-eyre = "0.6"
-rust-apt = "0.10.0"
+rust-apt = "0.11.2"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.150"
-hotpath = "0.24.0"
+hotpath = "0.25.1"
 
 [features]
 hotpath = ["hotpath/hotpath"]
@@ -30,7 +30,7 @@ name = "synh8"
 path = "src/main.rs"
 
 [[bin]]
-name = "debug_cli"
+name = "debug-cli"
 path = "src/bin/debug_cli.rs"
 
 [lints.clippy]

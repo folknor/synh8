@@ -4,11 +4,11 @@ mod ui;
 use std::io;
 
 use color_eyre::Result;
+use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 
 use app::App;
@@ -20,7 +20,10 @@ fn main() -> Result<()> {
     color_eyre::install()?;
 
     if !is_root() {
-        eprintln!("synh8 must be run as root. Try: sudo {}", std::env::args().next().unwrap_or_else(|| "synh8".into()));
+        eprintln!(
+            "synh8 must be run as root. Try: sudo {}",
+            std::env::args().next().unwrap_or_else(|| "synh8".into())
+        );
         std::process::exit(1);
     }
 
@@ -134,16 +137,20 @@ fn main() -> Result<()> {
                                     },
                                     FocusedPane::Details => match key.code {
                                         KeyCode::Up => {
-                                            app.details.scroll = app.details.scroll.saturating_sub(1);
+                                            app.details.scroll =
+                                                app.details.scroll.saturating_sub(1);
                                         }
                                         KeyCode::Down => {
-                                            app.details.scroll = app.details.scroll.saturating_add(1);
+                                            app.details.scroll =
+                                                app.details.scroll.saturating_add(1);
                                         }
                                         KeyCode::PageDown => {
-                                            app.details.scroll = app.details.scroll.saturating_add(10);
+                                            app.details.scroll =
+                                                app.details.scroll.saturating_add(10);
                                         }
                                         KeyCode::PageUp => {
-                                            app.details.scroll = app.details.scroll.saturating_sub(10);
+                                            app.details.scroll =
+                                                app.details.scroll.saturating_sub(10);
                                         }
                                         KeyCode::Home => {
                                             app.details.scroll = 0;
@@ -166,8 +173,7 @@ fn main() -> Result<()> {
                             app.core.search_query_pop();
                             app.execute_search();
                         }
-                        KeyCode::Up | KeyCode::Down
-                        | KeyCode::PageUp | KeyCode::PageDown => {
+                        KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
                             app.confirm_search();
                             app.ui.focused_pane = FocusedPane::Packages;
                             let delta = match key.code {
