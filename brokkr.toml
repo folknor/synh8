@@ -2,6 +2,3 @@ project = "synh8"
 
 [test]
 debug = true
-
-[gremlins]
-allow = ["U+2717"] # ✗ is an intentional TUI status symbol (PackageStatus::Broken)

@@ -8,18 +8,16 @@ repository = "https://github.com/folknor/synh8"
 keywords = ["apt", "tui", "debian", "ubuntu", "package-manager"]
 categories = ["command-line-utilities"]
 rust-version = "1.99"
-exclude = ["CLAUDE.md", "TODO.md"]
+exclude = ["CLAUDE.md", "notes/"]
 
 [dependencies]
-ratatui = "0.30.2"
+ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 color-eyre = "0.6"
 rust-apt = "0.11.2"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 libc = "0.2"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.150"
-hotpath = "0.25.1"
+hotpath = "0.26.0"
 
 [features]
 hotpath = ["hotpath/hotpath"]
@@ -28,10 +26,6 @@ hotpath-alloc = ["hotpath/hotpath", "hotpath/hotpath-alloc"]
 [[bin]]
 name = "synh8"
 path = "src/main.rs"
-
-[[bin]]
-name = "debug-cli"
-path = "src/bin/debug_cli.rs"
 
 [lints.clippy]
 # Style

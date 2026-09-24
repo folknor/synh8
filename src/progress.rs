@@ -5,10 +5,12 @@
 //! Both phases render into the same ratatui terminal as a centered modal.
 //!
 //! The progress terminal writes to `/dev/tty` directly, while `StdioRedirect`
-//! redirects fd 1/2 to `/dev/null` so dpkg's stdout output is suppressed.
+//! captures fd 1/2 so dpkg's output neither corrupts the screen nor is lost.
 
 use std::cell::RefCell;
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::FromRawFd;
 use std::rc::Rc;
 
 use ratatui::Terminal;
@@ -16,177 +18,177 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
 use rust_apt::raw::{AcqTextStatus, ItemDesc, PkgAcquire};
 
-use crate::types::PackageInfo;
+use crate::types::size_str;
 
 // ============================================================================
-// Types
+// Output capture
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProgressPhase {
-    Downloading,
-    Installing,
-    Done,
-}
-
-/// RAII guard that redirects stdout/stderr to a temp file.
-/// Restores the original file descriptors when dropped.
+/// Redirects stdout/stderr into an anonymous in-memory file (memfd), so the
+/// capture has no filesystem path another user could race or redirect.
+/// Call `finish()` to restore the descriptors and collect the output; if the
+/// guard is dropped instead, the descriptors are restored best-effort.
 pub struct StdioRedirect {
     saved_stdout: libc::c_int,
     saved_stderr: libc::c_int,
-    capture_path: std::path::PathBuf,
+    capture: File,
+    restored: bool,
 }
 
 impl StdioRedirect {
-    /// Redirect stdout and stderr to a temp file for later retrieval.
     pub fn capture() -> std::io::Result<Self> {
-        use std::os::unix::io::AsRawFd;
-
-        let capture_path = std::env::temp_dir().join("synh8-apt-output.tmp");
+        // SAFETY: plain fd syscalls; every fd opened here is either owned by
+        // the returned guard or closed on the error path.
         unsafe {
+            let fd = libc::memfd_create(c"synh8-apt-output".as_ptr(), libc::MFD_CLOEXEC);
+            if fd == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let capture = File::from_raw_fd(fd);
+
             let saved_stdout = libc::dup(libc::STDOUT_FILENO);
             if saved_stdout == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             let saved_stderr = libc::dup(libc::STDERR_FILENO);
             if saved_stderr == -1 {
+                let err = std::io::Error::last_os_error();
                 libc::close(saved_stdout);
-                return Err(std::io::Error::last_os_error());
+                return Err(err);
             }
-
-            let file = match std::fs::File::create(&capture_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    libc::close(saved_stdout);
-                    libc::close(saved_stderr);
-                    return Err(e);
-                }
-            };
-            let capture_fd = file.as_raw_fd();
-            if libc::dup2(capture_fd, libc::STDOUT_FILENO) == -1 {
-                libc::close(saved_stdout);
-                libc::close(saved_stderr);
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::dup2(capture_fd, libc::STDERR_FILENO) == -1 {
-                // Restore stdout before bailing out
-                libc::dup2(saved_stdout, libc::STDOUT_FILENO);
-                libc::close(saved_stdout);
-                libc::close(saved_stderr);
-                return Err(std::io::Error::last_os_error());
-            }
-            // file drops here closing capture_fd, but the dup'd fds keep it open
-
-            Ok(Self {
+            let mut guard = Self {
                 saved_stdout,
                 saved_stderr,
-                capture_path,
-            })
+                capture,
+                restored: true,
+            };
+            // dup2 clears FD_CLOEXEC, so dpkg children inherit fds 1 and 2.
+            if libc::dup2(fd, libc::STDOUT_FILENO) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            guard.restored = false;
+            if libc::dup2(fd, libc::STDERR_FILENO) == -1 {
+                let err = std::io::Error::last_os_error();
+                drop(guard.restore());
+                return Err(err);
+            }
+            Ok(guard)
         }
     }
 
-    /// Read the captured output.
-    pub fn output(&self) -> Vec<String> {
-        // Flush C stdio buffers so all libapt output is written to the file
+    fn restore(&mut self) -> std::io::Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        self.restored = true;
+        // SAFETY: the saved fds are owned by this guard and still open.
         unsafe {
             libc::fflush(std::ptr::null_mut());
+            let out = libc::dup2(self.saved_stdout, libc::STDOUT_FILENO);
+            let err = libc::dup2(self.saved_stderr, libc::STDERR_FILENO);
+            if out == -1 || err == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
         }
-        std::fs::read_to_string(&self.capture_path)
-            .unwrap_or_default()
+        Ok(())
+    }
+
+    /// Restore stdout/stderr and return the captured output. Output is
+    /// returned even if restoring failed, alongside the error.
+    pub fn finish(mut self) -> (Vec<String>, std::io::Result<()>) {
+        let restored = self.restore();
+        let mut bytes = Vec::new();
+        let read = self
+            .capture
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| self.capture.read_to_end(&mut bytes));
+        let lines = String::from_utf8_lossy(&bytes)
             .lines()
             .map(String::from)
-            .collect()
+            .collect();
+        (lines, restored.and(read.map(drop)))
     }
 }
 
 impl Drop for StdioRedirect {
     fn drop(&mut self) {
+        // Nowhere to report a failure from here; finish() is the checked path.
+        drop(self.restore());
+        // SAFETY: closing fds owned by this guard exactly once.
         unsafe {
-            let r1 = libc::dup2(self.saved_stdout, libc::STDOUT_FILENO);
-            debug_assert!(r1 != -1, "dup2 failed restoring stdout");
-            let r2 = libc::dup2(self.saved_stderr, libc::STDERR_FILENO);
-            debug_assert!(r2 != -1, "dup2 failed restoring stderr");
             libc::close(self.saved_stdout);
             libc::close(self.saved_stderr);
         }
-        drop(std::fs::remove_file(&self.capture_path));
     }
 }
 
-/// Snapshot of progress data passed to the render function.
-pub struct ProgressSnapshot<'a> {
-    pub phase: ProgressPhase,
-    pub percent: f64,
-    pub current_bytes: u64,
-    pub total_bytes: u64,
-    pub speed_bps: u64,
-    pub install_steps_done: u64,
-    pub install_total_steps: u64,
-    pub install_action: &'a str,
-    pub errors: &'a [String],
-    pub title: &'a str,
+// ============================================================================
+// Progress state
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressPhase {
+    Downloading,
+    Installing,
+}
+
+/// What the progress modal shows
+struct ProgressView {
+    phase: ProgressPhase,
+    percent: f64,
+    current_bytes: u64,
+    total_bytes: u64,
+    speed_bps: u64,
+    install_steps_done: u64,
+    install_total_steps: u64,
+    install_action: String,
+    errors: Vec<String>,
+    title: String,
 }
 
 /// Shared progress state, owned by `Rc<RefCell<_>>`.
 ///
-/// The terminal writes to `/dev/tty` directly, bypassing stdout.
-/// This allows dpkg output (which goes to fd 1) to be suppressed via
-/// `StdioRedirect` without affecting progress rendering.
+/// The terminal writes to `/dev/tty` directly, bypassing stdout, so dpkg's
+/// output can be captured by `StdioRedirect` without affecting rendering.
 pub struct ProgressState {
     terminal: Terminal<CrosstermBackend<File>>,
-    pub phase: ProgressPhase,
-    // Download phase
-    pub percent: f64,
-    pub current_bytes: u64,
-    pub total_bytes: u64,
-    pub speed_bps: u64,
-    // Install phase
-    pub install_steps_done: u64,
-    pub install_total_steps: u64,
-    pub install_action: String,
-    // Shared
-    pub errors: Vec<String>,
-    /// Title shown in the modal border
-    pub title: String,
+    view: ProgressView,
 }
 
 impl ProgressState {
     pub fn new(title: &str) -> std::io::Result<Self> {
         let tty = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
-        let backend = CrosstermBackend::new(tty);
-        let terminal = Terminal::new(backend)?;
+        let terminal = Terminal::new(CrosstermBackend::new(tty))?;
         Ok(Self {
             terminal,
-            phase: ProgressPhase::Downloading,
-            percent: 0.0,
-            current_bytes: 0,
-            total_bytes: 0,
-            speed_bps: 0,
-            install_steps_done: 0,
-            install_total_steps: 0,
-            install_action: String::new(),
-            errors: Vec::new(),
-            title: title.to_string(),
+            view: ProgressView {
+                phase: ProgressPhase::Downloading,
+                percent: 0.0,
+                current_bytes: 0,
+                total_bytes: 0,
+                speed_bps: 0,
+                install_steps_done: 0,
+                install_total_steps: 0,
+                install_action: String::new(),
+                errors: Vec::new(),
+                title: title.to_string(),
+            },
         })
     }
 
-    fn draw(&mut self) {
-        let snap = ProgressSnapshot {
-            phase: self.phase,
-            percent: self.percent,
-            current_bytes: self.current_bytes,
-            total_bytes: self.total_bytes,
-            speed_bps: self.speed_bps,
-            install_steps_done: self.install_steps_done,
-            install_total_steps: self.install_total_steps,
-            install_action: &self.install_action,
-            errors: &self.errors,
-            title: &self.title,
-        };
+    /// Errors reported by the download and install phases
+    pub fn errors(&self) -> &[String] {
+        &self.view.errors
+    }
 
-        drop(self.terminal.draw(|frame| {
-            render_progress_modal(frame, &snap);
-        }));
+    fn draw(&mut self) {
+        let view = &self.view;
+        // A failed progress frame is cosmetic: the operation itself carries
+        // on and reports its own result.
+        drop(
+            self.terminal
+                .draw(|frame| render_progress_modal(frame, view)),
+        );
     }
 }
 
@@ -221,6 +223,7 @@ impl rust_apt::progress::DynAcquireProgress for TuiAcquireProgress {
         if !error_text.is_empty() {
             let mut state = self.state.borrow_mut();
             state
+                .view
                 .errors
                 .push(format!("{}: {error_text}", item.short_desc()));
             state.draw();
@@ -229,16 +232,16 @@ impl rust_apt::progress::DynAcquireProgress for TuiAcquireProgress {
 
     fn pulse(&mut self, status: &AcqTextStatus, _owner: &PkgAcquire) {
         let mut state = self.state.borrow_mut();
-        state.percent = status.percent();
-        state.current_bytes = status.current_bytes();
-        state.total_bytes = status.total_bytes();
-        state.speed_bps = status.current_cps();
+        state.view.percent = status.percent();
+        state.view.current_bytes = status.current_bytes();
+        state.view.total_bytes = status.total_bytes();
+        state.view.speed_bps = status.current_cps();
         state.draw();
     }
 
     fn start(&mut self) {
         let mut state = self.state.borrow_mut();
-        state.phase = ProgressPhase::Downloading;
+        state.view.phase = ProgressPhase::Downloading;
         state.draw();
     }
 
@@ -270,10 +273,10 @@ impl rust_apt::progress::DynInstallProgress for TuiInstallProgress {
         action: String,
     ) {
         let mut state = self.state.borrow_mut();
-        state.phase = ProgressPhase::Installing;
-        state.install_steps_done = steps_done;
-        state.install_total_steps = total_steps;
-        state.install_action = if pkgname.is_empty() {
+        state.view.phase = ProgressPhase::Installing;
+        state.view.install_steps_done = steps_done;
+        state.view.install_total_steps = total_steps;
+        state.view.install_action = if pkgname.is_empty() {
             action
         } else {
             format!("{action} {pkgname}")
@@ -283,7 +286,7 @@ impl rust_apt::progress::DynInstallProgress for TuiInstallProgress {
 
     fn error(&mut self, pkgname: String, _steps_done: u64, _total_steps: u64, error: String) {
         let mut state = self.state.borrow_mut();
-        state.errors.push(format!("{pkgname}: {error}"));
+        state.view.errors.push(format!("{pkgname}: {error}"));
         state.draw();
     }
 }
@@ -292,61 +295,50 @@ impl rust_apt::progress::DynInstallProgress for TuiInstallProgress {
 // Rendering - compact centered modal
 // ============================================================================
 
-fn render_progress_modal(frame: &mut Frame, snap: &ProgressSnapshot) {
-    let &ProgressSnapshot {
-        phase,
-        percent,
-        current_bytes,
-        total_bytes,
-        speed_bps,
-        install_steps_done,
-        install_total_steps,
-        install_action,
-        errors,
-        title,
-    } = snap;
+/// Rect of at most `width` x `height`, centered in `area` and clipped to it.
+pub fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    )
+}
+
+fn render_progress_modal(frame: &mut Frame, view: &ProgressView) {
     let area = frame.area();
 
-    // Modal size: roomy when no errors, expands to show errors
-    let modal_width = 70.min(area.width.saturating_sub(4));
     // border(1) + pad(1) + status(1) + pad(1) + gauge(1) + pad(1) + detail(1) + pad(1) + border(1)
     let base_height: u16 = 9;
-    let error_height = if errors.is_empty() {
+    let error_height = if view.errors.is_empty() {
         0
     } else {
         // 1 for separator + up to 4 error lines
-        1 + (errors.len() as u16).min(4)
+        1 + (view.errors.len() as u16).min(4)
     };
-    let modal_height = (base_height + error_height).min(area.height.saturating_sub(2));
-
-    let modal_x = area.x + (area.width - modal_width) / 2;
-    let modal_y = area.y + (area.height - modal_height) / 2;
-    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+    let modal_area = centered_rect(
+        area,
+        70.min(area.width.saturating_sub(4)),
+        (base_height + error_height).min(area.height.saturating_sub(2)),
+    );
 
     frame.render_widget(Clear, modal_area);
 
-    let border_color = match phase {
+    let accent = match view.phase {
         ProgressPhase::Downloading => Color::Cyan,
         ProgressPhase::Installing => Color::Green,
-        ProgressPhase::Done => Color::Green,
     };
     let block = Block::default()
-        .title(format!(" {title} "))
+        .title(format!(" {} ", view.title))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color));
+        .border_style(Style::default().fg(accent));
     let inner = block.inner(modal_area);
     frame.render_widget(block, modal_area);
 
     // Inner layout: pad, status, pad, gauge, pad, detail, pad, [errors]
-    let mut constraints = vec![
-        Constraint::Length(1), // top padding
-        Constraint::Length(1), // status line
-        Constraint::Length(1), // spacing
-        Constraint::Length(1), // progress bar
-        Constraint::Length(1), // spacing
-        Constraint::Length(1), // detail line (bytes or action)
-        Constraint::Length(1), // bottom padding
-    ];
+    let mut constraints = vec![Constraint::Length(1); 7];
     if error_height > 0 {
         constraints.push(Constraint::Min(error_height));
     }
@@ -355,88 +347,64 @@ fn render_progress_modal(frame: &mut Frame, snap: &ProgressSnapshot) {
         .constraints(constraints)
         .split(inner);
 
-    match phase {
+    let (status, ratio, detail) = match view.phase {
         ProgressPhase::Downloading => {
-            // Status: "Downloading...  45%  2.1 MB/s"
-            let speed_str = if speed_bps > 0 {
-                format!("  {}/s", PackageInfo::size_str(speed_bps))
+            let speed = if view.speed_bps > 0 {
+                format!("  {}/s", size_str(view.speed_bps))
             } else {
                 String::new()
             };
             let status = Line::from(vec![
-                Span::styled("Downloading... ", Style::default().fg(Color::Cyan)),
+                Span::styled("Downloading... ", Style::default().fg(accent)),
                 Span::styled(
-                    format!("{percent:.0}%"),
+                    format!("{:.0}%", view.percent),
                     Style::default().fg(Color::White).bold(),
                 ),
-                Span::styled(speed_str, Style::default().fg(Color::DarkGray)),
+                Span::styled(speed, Style::default().fg(Color::DarkGray)),
             ]);
-            frame.render_widget(Paragraph::new(status), chunks[1]);
-
-            // Gauge
-            let ratio = (percent / 100.0).clamp(0.0, 1.0);
-            let gauge = Gauge::default()
-                .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
-                .ratio(ratio);
-            frame.render_widget(gauge, chunks[3]);
-
-            // Detail: byte counter
-            let detail = Line::from(Span::styled(
-                format!(
-                    "{} / {}",
-                    PackageInfo::size_str(current_bytes),
-                    PackageInfo::size_str(total_bytes),
-                ),
-                Style::default().fg(Color::DarkGray),
-            ));
-            frame.render_widget(Paragraph::new(detail), chunks[5]);
+            let detail = format!(
+                "{} / {}",
+                size_str(view.current_bytes),
+                size_str(view.total_bytes)
+            );
+            (status, view.percent / 100.0, detail)
         }
         ProgressPhase::Installing => {
-            // Status: "Installing...  Step 14 / 38"
             let status = Line::from(vec![
-                Span::styled("Installing... ", Style::default().fg(Color::Green)),
+                Span::styled("Installing... ", Style::default().fg(accent)),
                 Span::styled(
-                    format!("Step {install_steps_done} / {install_total_steps}"),
+                    format!(
+                        "Step {} / {}",
+                        view.install_steps_done, view.install_total_steps
+                    ),
                     Style::default().fg(Color::White).bold(),
                 ),
             ]);
-            frame.render_widget(Paragraph::new(status), chunks[1]);
-
-            // Gauge
-            let ratio = if install_total_steps > 0 {
-                (install_steps_done as f64 / install_total_steps as f64).clamp(0.0, 1.0)
+            let ratio = if view.install_total_steps > 0 {
+                view.install_steps_done as f64 / view.install_total_steps as f64
             } else {
                 0.0
             };
-            let gauge = Gauge::default()
-                .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
-                .ratio(ratio);
-            frame.render_widget(gauge, chunks[3]);
-
-            // Detail: current action
-            let detail = Line::from(Span::styled(
-                install_action,
-                Style::default().fg(Color::DarkGray),
-            ));
-            frame.render_widget(Paragraph::new(detail), chunks[5]);
+            (status, ratio, view.install_action.clone())
         }
-        ProgressPhase::Done => {
-            let status = Line::from(Span::styled(
-                "Complete.",
-                Style::default().fg(Color::Green).bold(),
-            ));
-            frame.render_widget(Paragraph::new(status), chunks[1]);
+    };
 
-            let gauge = Gauge::default()
-                .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
-                .ratio(1.0);
-            frame.render_widget(gauge, chunks[3]);
-        }
-    }
+    frame.render_widget(Paragraph::new(status), chunks[1]);
+    let gauge = Gauge::default()
+        .gauge_style(Style::default().fg(accent).bg(Color::DarkGray))
+        .ratio(ratio.clamp(0.0, 1.0));
+    frame.render_widget(gauge, chunks[3]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            detail,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[5],
+    );
 
-    // Errors section (only shown when errors exist)
     if error_height > 0 && chunks.len() > 7 {
-        let error_lines: Vec<Line> = errors
+        let error_lines: Vec<Line> = view
+            .errors
             .iter()
             .rev()
             .take(4)
@@ -445,5 +413,19 @@ fn render_progress_modal(frame: &mut Frame, snap: &ProgressSnapshot) {
             .collect();
         let error_para = Paragraph::new(error_lines).wrap(Wrap { trim: false });
         frame.render_widget(error_para, chunks[7]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn centered_rect_never_exceeds_area() {
+        let area = Rect::new(2, 3, 10, 4);
+        let r = centered_rect(area, 50, 7);
+        assert_eq!(r, area);
+        let r = centered_rect(Rect::new(0, 0, 20, 10), 10, 4);
+        assert_eq!(r, Rect::new(5, 3, 10, 4));
     }
 }

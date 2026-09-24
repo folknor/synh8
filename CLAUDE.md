@@ -53,42 +53,44 @@ Instrumented functions: `core::plan`, `core::rebuild_list`, `core::toggle`,
 
 ### Source layout
 
-- `main.rs` - event loop, key dispatch
-- `app.rs` - TUI application state, wraps `ManagerState` with UI state
+- `main.rs` - terminal setup and event loop
+- `app.rs` - TUI application state and key handling, wraps `ManagerState`
 - `ui.rs` - ratatui rendering (windowed table rendering for large lists)
-- `core.rs` - typestate package manager (~1600 lines), filter caching
+- `core.rs` - typestate package manager, planning, filter caching
+- `keymap.rs` - keybinding registry (dispatch, help bar, `docs/keybindings.md`)
 - `types.rs` - enums, structs, type definitions
-- `apt.rs` - thin wrapper around rust-apt with stable `PackageId` handles
+- `apt.rs` - thin wrapper around rust-apt with `PackageId` handles
 - `search.rs` - SQLite FTS5 full-text search across package names
-- `progress.rs` - terminal progress rendering for downloads/installs
+- `progress.rs` - progress modal for downloads/installs, stdout/stderr capture
+- `version.rs` - Debian version comparison (pure Rust, used for sorting)
 
 ### Typestate pattern (core.rs)
 
 `PackageManager<S>` uses compile-time states:
 
-- **`Clean`** - no user marks. Can mark packages (→ Dirty).
-- **`Dirty`** - has marks, no computed plan. Can plan (→ Planned) or reset (→ Clean).
-- **`Planned`** - dependencies resolved, changeset computed. Can commit or modify (→ Dirty).
+- **`Clean`** - no intents, no APT marks. `edit()` → Dirty.
+- **`Dirty`** - intents edited, APT marks not derived yet. `plan()` → Planned, `reset()` → Clean.
+- **`Planned`** - dependencies resolved, changeset computed. `modify()` → Dirty, `commit()` → Clean.
 
-```rust
-pub struct PackageManager<S> {
-    shared: SharedState,
-    state: S,
-    _phantom: PhantomData<S>,
-}
-```
-
-Because consuming-self types can't be held in the TUI, `ManagerState` enum wraps all three variants plus a `Transitioning` placeholder used during `std::mem::take` transitions. `Transitioning` must never be observed outside a `&mut self` method body.
+`ManagerState` holds whichever is current for the TUI. Its `edit_intents()`
+always re-plans (or resets to Clean when no intents remain), so outside
+core.rs the state is only ever Clean or Planned. `Transitioning` is a
+placeholder that exists only inside `ManagerState::transition()`; every
+transition is infallible.
 
 ### User intent model
 
-`user_intent: HashMap<PackageId, UserIntent>` is the single source of truth for what the user wants. APT marks are derived from intent via `plan()`, not set directly. Display status is overlaid at render time from base status + user_intent + planned_changes.
+`user_intent: HashMap<PackageId, UserIntent>` (Install / Remove / Hold) is the single source of truth for what the user wants. APT marks are derived from intent via `plan()`, never set directly. `plan()` protects every intent in the APT resolver (as apt-get protects the packages on its command line), so the resolver reports an error instead of dropping a mark; plans with resolver errors cannot be committed. Display status is overlaid on base statuses from user_intent, then planned changes.
+
+Mark actions in the UI snapshot intents and planned ids first, then diff the new plan against them (`diff_since`); cancel restores the snapshot.
+
+### Cache generations
+
+`PackageId`s are numbered per cache generation. `AptCache::reload()` (after every commit and `apt update`) renumbers everything; core.rs carries intents across by full name and clears the filter cache and search index.
 
 ### Filter caching
 
-`rebuild_list()` results are memoized per `FilterCategory` with base statuses (before user_intent overlay). Cache entries persist across switches and are cloned on restore with fresh overlay. Pre-warmed at startup.
-
-Invalidation: `compute_plan()` clears MarkedChanges only; `refresh()`/`commit()` clears all entries.
+`rebuild_list()` results are memoized per `FilterCategory` with base statuses (before the overlay). Cache entries persist across switches and are cloned on restore with a fresh overlay. MarkedChanges is never cached: it is built from intents plus the plan. Warmed incrementally during idle event-loop cycles (`App::warm_next`). Cleared on reload.
 
 ### Windowed rendering
 
@@ -97,17 +99,18 @@ Invalidation: `compute_plan()` clears MarkedChanges only; `refresh()`/`commit()`
 ## Conventions
 
 - Strict clippy lints: `unwrap_used` is NOT denied (unlike pbfhogg), but several style and correctness lints are deny-level. See `[lints.clippy]` in Cargo.toml.
-- No test suite. Manual TUI testing only (requires root + apt packages).
+- Unit tests cover the pure logic (version order, search query escaping, sizes, scrolling, status overlay, keymap). Anything touching the APT cache or the TUI is tested manually (requires root + apt packages).
+- Keybindings live only in `src/keymap.rs`. After changing them, regenerate `docs/keybindings.md` with `SYNH8_BLESS=1 brokkr check`; a test fails if it drifts.
 - Single-threaded - no async, no threading. rust-apt types are not Send.
 - `PackageId` is an opaque handle valid for one cache generation. Maps to full package names (including arch, e.g., "libfoo:amd64").
 
 ## Key dependencies
 
-- **rust-apt 0.9** - APT cache bindings (main FFI dependency)
-- **ratatui 0.30** - TUI rendering
-- **crossterm 0.28** - terminal I/O
-- **rusqlite 0.39 (bundled)** - SQLite FTS5 search index
-- **hotpath 0.14** - function-level profiling
+- **rust-apt 0.11** - APT cache bindings (main FFI dependency)
+- **ratatui 0.30** - TUI rendering (`unstable-rendered-line-info` for scroll limits)
+- **crossterm 0.29** - terminal I/O
+- **rusqlite 0.40 (bundled)** - SQLite FTS5 search index
+- **hotpath 0.26** - function-level profiling
 
 ## Performance notes
 
@@ -118,6 +121,7 @@ The dominant cost in this codebase is rust-apt FFI property extraction when iter
 - `depcache().clear_marked()` replaced per-package mark_keep loop: 401ms → 114ms.
 - Filter cache eliminates FFI on repeated filter switches: ~25ms cache hit vs ~450ms cold miss.
 - Windowed rendering: ~300µs per frame regardless of list size.
+- A single mark (re-plan including resolver protection): ~200ms. Cold All-list rebuild including the version sort: ~450-550ms.
 
 ## Document folders
 

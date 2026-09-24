@@ -1,77 +1,67 @@
 //! Core business logic - Typestate Package Manager
 //!
-//! This module implements a typestate-based package manager where:
 //! - `user_intent: HashMap<PackageId, UserIntent>` is the single source of truth
 //! - APT marks are derived from intent via `plan()`
-//! - State transitions are enforced at compile time
+//! - `PackageManager<S>` enforces the Clean -> Dirty -> Planned transitions at
+//!   compile time; `ManagerState` holds whichever one is current for the TUI
+//!   and always re-plans after an intent edit, so outside this module the
+//!   state is only ever Clean (no intents) or Planned.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::os::unix::io::AsRawFd;
 
 use color_eyre::Result;
+use color_eyre::eyre::eyre;
+use rust_apt::DepType;
 use rust_apt::cache::PackageSort;
 
-use crate::apt::{AptCache, format_apt_errors};
+use crate::apt::{AptCache, plan_problems};
 use crate::search::SearchIndex;
 use crate::types::*;
-
-// ============================================================================
-// Search State (shared across all manager states)
-// ============================================================================
-
-/// Search state management
-#[derive(Default)]
-pub struct SearchState {
-    pub index: Option<SearchIndex>,
-    pub query: String,
-    pub results: Option<HashSet<String>>,
-}
-
-/// Sort configuration
-#[derive(Clone)]
-pub struct SortSettings {
-    pub sort_by: SortBy,
-    pub ascending: bool,
-}
-
-impl Default for SortSettings {
-    fn default() -> Self {
-        Self {
-            sort_by: SortBy::CandidateVersion,
-            ascending: true,
-        }
-    }
-}
+use crate::version;
 
 // ============================================================================
 // Shared State (across all typestate variants)
 // ============================================================================
 
+/// Search state management
+#[derive(Default)]
+struct SearchState {
+    index: Option<SearchIndex>,
+    query: String,
+    results: Option<HashSet<String>>,
+}
+
 /// State shared across all PackageManager states.
-/// Fields are private to prevent bypassing the typestate API.
+/// Fields are private to this module so only the typestate API mutates them.
 struct SharedState {
     cache: AptCache,
     user_intent: HashMap<PackageId, UserIntent>,
+    /// Packages currently protected in the APT resolver (see `plan()`)
+    protected: Vec<PackageId>,
     search: SearchState,
     list: Vec<PackageInfo>,
-    /// Per-filter memoization of rebuild_list() results.
-    /// Keyed by FilterCategory only; search/sort are applied in-memory.
-    /// Invalidation: compute_plan() clears MarkedChanges only;
-    /// refresh()/commit() clear all entries.
+    /// Per-filter memoization of the extracted list, with BASE statuses
+    /// (before the intent/plan overlay). Search and sort are applied on top.
+    /// MarkedChanges is never cached: it is built from the (small) set of
+    /// intents and planned changes. Cleared when the cache is reloaded.
     filter_cache: HashMap<FilterCategory, (Vec<PackageInfo>, ColumnWidths)>,
     upgradable_count: usize,
     installed_count: usize,
     total_count: usize,
     selected_filter: FilterCategory,
-    sort_settings: SortSettings,
+    sort: SortSettings,
+    /// APT failures from operations that have no plan to report them in
+    /// (resetting marks). Drained by the UI via `take_apt_errors()`.
+    apt_errors: Vec<String>,
 }
 
 impl SharedState {
     fn new(cache: AptCache) -> Self {
-        Self {
+        let mut shared = Self {
             cache,
             user_intent: HashMap::new(),
+            protected: Vec::new(),
             search: SearchState::default(),
             list: Vec::new(),
             filter_cache: HashMap::new(),
@@ -79,8 +69,21 @@ impl SharedState {
             installed_count: 0,
             total_count: 0,
             selected_filter: FilterCategory::Upgradable,
-            sort_settings: SortSettings::default(),
-        }
+            sort: SortSettings::default(),
+            apt_errors: Vec::new(),
+        };
+        shared.compute_cache_counts();
+        shared
+    }
+
+    /// Everything derived from a cache generation, discarded after a reload.
+    /// Intents are cleared too: their ids belong to the old generation.
+    fn forget_generation(&mut self) {
+        self.user_intent.clear();
+        self.protected.clear();
+        self.filter_cache.clear();
+        self.search = SearchState::default();
+        self.compute_cache_counts();
     }
 
     /// Compute and cache package counts from the APT cache
@@ -99,6 +102,201 @@ impl SharedState {
             }
         }
     }
+
+    /// Ids that belong in the MarkedChanges filter: every intent plus
+    /// everything in the plan.
+    fn marked_ids(&self, planned: Option<&[PlannedChange]>) -> HashSet<PackageId> {
+        let mut ids: HashSet<PackageId> = self.user_intent.keys().copied().collect();
+        ids.extend(planned.unwrap_or_default().iter().map(|c| c.package));
+        ids
+    }
+
+    /// Rebuild the package list for the current filter and search, then
+    /// overlay intents and planned changes and sort.
+    fn rebuild_list(&mut self, planned: Option<&[PlannedChange]>) -> ColumnWidths {
+        let filter = self.selected_filter;
+        let has_search = self.search.results.is_some();
+
+        let cached = if filter == FilterCategory::MarkedChanges || has_search {
+            None
+        } else {
+            self.filter_cache.get(&filter).cloned()
+        };
+
+        let (mut list, col_widths) = match cached {
+            Some(hit) => hit,
+            None => {
+                let ids = if filter == FilterCategory::MarkedChanges {
+                    // Small set: look the packages up directly instead of
+                    // walking the whole cache.
+                    let search_results = self.search.results.as_ref();
+                    self.marked_ids(planned)
+                        .into_iter()
+                        .filter(|&id| {
+                            search_results.is_none_or(|r| {
+                                self.cache
+                                    .get_by_id(id)
+                                    .is_some_and(|pkg| r.contains(pkg.name()))
+                            })
+                        })
+                        .collect()
+                } else {
+                    self.matching_ids(|pkg| match filter {
+                        FilterCategory::Upgradable => pkg.is_upgradable(),
+                        FilterCategory::Installed => pkg.is_installed(),
+                        FilterCategory::NotInstalled => !pkg.is_installed(),
+                        FilterCategory::All | FilterCategory::MarkedChanges => true,
+                    })
+                };
+                let list: Vec<PackageInfo> = ids
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.cache
+                            .get_by_id(id)
+                            .and_then(|pkg| self.cache.extract_package_info(&pkg))
+                    })
+                    .collect();
+                let col_widths = self.column_widths(&list);
+                if !has_search && filter != FilterCategory::MarkedChanges {
+                    self.filter_cache
+                        .insert(filter, (list.clone(), col_widths.clone()));
+                }
+                (list, col_widths)
+            }
+        };
+
+        overlay_statuses(&mut list, &self.user_intent, planned);
+        self.list = list;
+        self.sort_list();
+        col_widths
+    }
+
+    /// Ids of packages passing `keep` and the active search
+    fn matching_ids(&self, keep: impl Fn(&rust_apt::Package) -> bool) -> Vec<PackageId> {
+        let sort = if self.selected_filter == FilterCategory::Upgradable {
+            PackageSort::default().upgradable()
+        } else {
+            PackageSort::default()
+        };
+        let search_results = self.search.results.as_ref();
+        self.cache
+            .packages(&sort)
+            .filter(|pkg| search_results.is_none_or(|r| r.contains(pkg.name())))
+            .filter(|pkg| keep(pkg))
+            .filter_map(|pkg| self.cache.id_of(&pkg))
+            .collect()
+    }
+
+    fn column_widths(&self, list: &[PackageInfo]) -> ColumnWidths {
+        let mut w = ColumnWidths::default();
+        for pkg in list {
+            w.name = w.name.max(self.cache.display_name(&pkg.name).len() as u16);
+            w.section = w.section.max(pkg.section.len() as u16);
+            w.installed = w.installed.max(pkg.installed_version.len() as u16);
+            w.candidate = w.candidate.max(pkg.candidate_version.len() as u16);
+        }
+        w
+    }
+
+    fn sort_list(&mut self) {
+        let SortSettings { sort_by, ascending } = self.sort;
+        self.list.sort_by(|a, b| {
+            let ord = compare_packages(a, b, sort_by);
+            if ascending { ord } else { ord.reverse() }
+        });
+    }
+
+    fn set_search_query(&mut self, query: &str) -> Result<()> {
+        self.search.query = query.to_string();
+        if query.is_empty() {
+            self.search.results = None;
+        } else {
+            let index = match self.search.index.take() {
+                Some(index) => index,
+                None => SearchIndex::build(&self.cache)?,
+            };
+            let results = index.search(query);
+            self.search.index = Some(index);
+            self.search.results = Some(results?);
+        }
+        Ok(())
+    }
+
+    /// Clear APT marks and resolver protection. Errors are kept for the UI.
+    fn clear_apt_state(&mut self) -> Result<(), String> {
+        for id in self.protected.drain(..) {
+            self.cache.unprotect(id);
+        }
+        self.cache.clear_all_marks()
+    }
+}
+
+/// Order two packages by a sort column, falling back to name.
+fn compare_packages(a: &PackageInfo, b: &PackageInfo, sort_by: SortBy) -> Ordering {
+    let primary = match sort_by {
+        SortBy::Name => Ordering::Equal,
+        SortBy::Section => a.section.cmp(&b.section),
+        SortBy::InstalledVersion => compare_versions(&a.installed_version, &b.installed_version),
+        SortBy::CandidateVersion => compare_versions(&a.candidate_version, &b.candidate_version),
+    };
+    primary.then_with(|| a.name.cmp(&b.name))
+}
+
+/// Debian version order, with "no version" sorting first.
+fn compare_versions(a: &str, b: &str) -> Ordering {
+    match (a.is_empty(), b.is_empty()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => version::compare(a, b),
+    }
+}
+
+/// Turn base statuses into display statuses: intents first, then the plan
+/// (which wins, since it is what will actually happen).
+fn overlay_statuses(
+    list: &mut [PackageInfo],
+    user_intent: &HashMap<PackageId, UserIntent>,
+    planned: Option<&[PlannedChange]>,
+) {
+    let planned: HashMap<PackageId, ChangeAction> = planned
+        .unwrap_or_default()
+        .iter()
+        .map(|c| (c.package, c.action))
+        .collect();
+    for info in list.iter_mut() {
+        if let Some(&intent) = user_intent.get(&info.id) {
+            info.status = match intent {
+                UserIntent::Install if info.status == PackageStatus::Upgradable => {
+                    PackageStatus::MarkedForUpgrade
+                }
+                UserIntent::Install => PackageStatus::MarkedForInstall,
+                UserIntent::Remove => PackageStatus::MarkedForRemove,
+                UserIntent::Hold => PackageStatus::Held,
+            };
+        }
+        if let Some(action) = planned.get(&info.id) {
+            info.status = action.status();
+        }
+    }
+}
+
+/// Download size and installed-size delta of one planned change.
+/// `new` is the (download, installed) size of the version being installed,
+/// `old_installed` the installed size of the version on disk.
+fn change_sizes(
+    action: ChangeAction,
+    new: Option<(u64, u64)>,
+    old_installed: Option<u64>,
+) -> (u64, i64) {
+    let old = old_installed.unwrap_or(0) as i64;
+    let (download, new_installed) = new.map_or((0, 0), |(d, i)| (d, i as i64));
+    match action {
+        ChangeAction::Remove => (0, -old),
+        ChangeAction::Install => (download, new_installed),
+        ChangeAction::Upgrade | ChangeAction::Downgrade => (download, new_installed - old),
+        ChangeAction::Reinstall => (download, 0),
+    }
 }
 
 // ============================================================================
@@ -111,493 +309,168 @@ pub struct PackageManager<S> {
     state: S,
 }
 
-// Clean state - no user marks
-impl PackageManager<Clean> {
-    /// Create a new PackageManager in Clean state
-    pub fn new() -> Result<Self> {
-        let cache = AptCache::new()?;
-        let mut shared = SharedState::new(cache);
-        shared.compute_cache_counts();
-
-        let mut mgr = Self {
-            shared,
-            state: Clean,
-        };
-        mgr.rebuild_list();
-        Ok(mgr)
-    }
-
-    /// Mark a package for install/upgrade, transitioning to Dirty
-    pub fn mark_install(mut self, id: PackageId) -> PackageManager<Dirty> {
-        self.shared.user_intent.insert(id, UserIntent::Install);
+impl<S> PackageManager<S> {
+    fn with_state<T>(self, state: T) -> PackageManager<T> {
         PackageManager {
             shared: self.shared,
-            state: Dirty,
+            state,
         }
     }
 }
 
-// Dirty state - has user marks, no computed plan
+// Clean state - no user intents, no APT marks
+impl PackageManager<Clean> {
+    /// Create a new PackageManager in Clean state
+    pub fn new() -> Result<Self> {
+        let mut mgr = Self {
+            shared: SharedState::new(AptCache::new()?),
+            state: Clean,
+        };
+        mgr.shared.rebuild_list(None);
+        Ok(mgr)
+    }
+
+    /// Start editing intents
+    pub fn edit(self) -> PackageManager<Dirty> {
+        self.with_state(Dirty)
+    }
+}
+
+// Dirty state - intents edited, APT marks not yet derived from them
 impl PackageManager<Dirty> {
-    /// Mark a package for install/upgrade
-    pub fn mark_install(mut self, id: PackageId) -> Self {
-        self.shared.user_intent.insert(id, UserIntent::Install);
+    pub fn set_intent(mut self, id: PackageId, intent: UserIntent) -> Self {
+        self.shared.user_intent.insert(id, intent);
         self
     }
 
-    /// Unmark a package (remove user intent)
-    pub fn unmark(mut self, id: PackageId) -> Self {
+    pub fn clear_intent(mut self, id: PackageId) -> Self {
         self.shared.user_intent.remove(&id);
         self
     }
 
-    /// Reset all marks, returning to Clean state
-    pub fn reset(mut self) -> PackageManager<Clean> {
-        self.shared.user_intent.clear();
-        self.shared
-            .cache
-            .clear_all_marks()
-            .expect("APT state corruption: failed to clear marks during reset");
-        PackageManager {
-            shared: self.shared,
-            state: Clean,
-        }
+    pub fn has_intents(&self) -> bool {
+        !self.shared.user_intent.is_empty()
     }
 
-    /// Compute plan from user intent, transitioning to Planned
+    /// Drop all intents and APT marks, returning to Clean state
+    pub fn reset(mut self) -> PackageManager<Clean> {
+        self.shared.user_intent.clear();
+        if let Err(e) = self.shared.clear_apt_state() {
+            self.shared.apt_errors.push(e);
+        }
+        self.with_state(Clean)
+    }
+
+    /// Derive APT marks from intents and resolve, transitioning to Planned.
+    ///
+    /// Every intent is protected in the resolver, as apt-get protects the
+    /// packages named on its command line: the resolver must satisfy them or
+    /// report an error, never quietly undo them.
     #[hotpath::measure]
     pub fn plan(mut self) -> PackageManager<Planned> {
-        // 1. Clear all APT marks
-        self.shared
-            .cache
-            .clear_all_marks()
-            .expect("APT state corruption: failed to clear marks during plan");
+        let mut problems = PlanProblems::default();
+        let shared = &mut self.shared;
 
-        // 2. Apply user intent to APT cache
-        for (&id, &intent) in &self.shared.user_intent {
+        if let Err(e) = shared.clear_apt_state() {
+            problems.errors.push(e);
+        }
+
+        // Holds and removals first, so installs are resolved around them.
+        let mut intents: Vec<(PackageId, UserIntent)> =
+            shared.user_intent.iter().map(|(&id, &i)| (id, i)).collect();
+        intents.sort_by_key(|&(id, intent)| {
+            let rank = match intent {
+                UserIntent::Hold => 0,
+                UserIntent::Remove => 1,
+                UserIntent::Install => 2,
+            };
+            (rank, id.index())
+        });
+        for (id, intent) in intents {
             match intent {
-                UserIntent::Install => self.shared.cache.mark_install_id(id),
-                UserIntent::Remove => self.shared.cache.mark_delete_id(id),
-                UserIntent::Hold => self.shared.cache.mark_keep_id(id),
-                UserIntent::Default => {}
+                UserIntent::Install => shared.cache.mark_install(id),
+                UserIntent::Remove => shared.cache.mark_delete(id),
+                UserIntent::Hold => shared.cache.mark_keep(id),
+            }
+            shared.cache.protect(id);
+            shared.protected.push(id);
+        }
+
+        if let Err(e) = shared.cache.resolve() {
+            let resolved = plan_problems(&e);
+            problems.errors.extend(resolved.errors);
+            problems.warnings.extend(resolved.warnings);
+            if problems.errors.is_empty() && problems.warnings.is_empty() {
+                problems
+                    .errors
+                    .push("Dependency resolution failed (no details available)".to_string());
             }
         }
 
-        // 3. Resolve dependencies
-        let errors = match self.shared.cache.resolve() {
-            Ok(()) => Vec::new(),
-            Err(e) => vec![format_apt_errors(&e)],
-        };
-
-        // 4. Collect raw change data from APT state
-        // (separate pass to avoid borrow conflict)
-        let change_data: Vec<_> = self
-            .shared
-            .cache
-            .get_changes()
-            .map(|pkg| {
-                let fullname = pkg.fullname(false);
-                let is_installed = pkg.is_installed();
-                let marked_install = pkg.marked_install();
-                let marked_upgrade = pkg.marked_upgrade();
-                let marked_delete = pkg.marked_delete();
-                let candidate_info = pkg.candidate().map(|c| (c.size(), c.installed_size()));
-                (
-                    fullname,
-                    is_installed,
-                    marked_install,
-                    marked_upgrade,
-                    marked_delete,
-                    candidate_info,
-                )
-            })
-            .collect();
-
-        // 5. Build PlannedChanges from raw data
         let mut changes = Vec::new();
-        let mut download_size = 0u64;
-        let mut install_size_change = 0i64;
-
-        for (
-            fullname,
-            is_installed,
-            marked_install,
-            marked_upgrade,
-            marked_delete,
-            candidate_info,
-        ) in change_data
-        {
-            let id = self.shared.cache.id_for(&fullname);
-
-            let is_user_requested = self.shared.user_intent.contains_key(&id);
-
-            let (action, reason) = if marked_install || marked_upgrade {
-                let action = if is_installed {
-                    ChangeAction::Upgrade
-                } else {
-                    ChangeAction::Install
-                };
-                let reason = if is_user_requested {
-                    ChangeReason::UserRequested
-                } else {
-                    ChangeReason::Dependency
-                };
-                (action, reason)
-            } else if marked_delete {
-                let reason = if is_user_requested {
-                    ChangeReason::UserRequested
-                } else {
-                    ChangeReason::AutoRemove
-                };
-                (ChangeAction::Remove, reason)
-            } else {
+        for pkg in shared.cache.get_changes() {
+            let Some(action) = ChangeAction::from_marked(pkg.marked()) else {
                 continue;
             };
-
-            let (pkg_download, pkg_size_change) = if let Some((dl_size, inst_size)) = candidate_info
-            {
-                let sz = if action == ChangeAction::Remove {
-                    -(inst_size as i64)
-                } else {
-                    inst_size as i64
-                };
-                (dl_size, sz)
-            } else {
-                (0, 0)
+            let Some(id) = shared.cache.id_of(&pkg) else {
+                continue;
             };
-
-            download_size += pkg_download;
-            install_size_change += pkg_size_change;
-
+            let reason = if shared.user_intent.contains_key(&id) {
+                ChangeReason::UserRequested
+            } else {
+                ChangeReason::Dependency
+            };
+            let new = pkg.candidate().map(|c| (c.size(), c.installed_size()));
+            let old = pkg.installed().map(|v| v.installed_size());
+            let (download_size, size_change) = change_sizes(action, new, old);
             changes.push(PlannedChange {
                 package: id,
                 action,
                 reason,
-                download_size: pkg_download,
-                size_change: pkg_size_change,
+                download_size,
+                size_change,
             });
         }
 
         let planned = Planned {
+            download_size: changes.iter().map(|c| c.download_size).sum(),
+            install_size_change: changes.iter().map(|c| c.size_change).sum(),
             changes,
-            download_size,
-            install_size_change,
-            errors,
+            problems,
         };
-
-        PackageManager {
-            shared: self.shared,
-            state: planned,
-        }
+        self.with_state(planned)
     }
 }
 
 // Planned state - dependencies resolved, changeset computed
 impl PackageManager<Planned> {
-    /// Get the computed changes
-    pub fn changes(&self) -> &[PlannedChange] {
-        &self.state.changes
-    }
-
-    /// Apply planned changes to update package statuses in the list.
-    /// No distinction between user-marked and dependency - all marked packages look the same.
-    pub fn apply_planned_statuses(&mut self) {
-        // Build a map of PackageId -> action from planned changes
-        let change_map: HashMap<PackageId, ChangeAction> = self
-            .state
-            .changes
-            .iter()
-            .map(|c| (c.package, c.action))
-            .collect();
-
-        // Update statuses in the list - no user vs dependency distinction
-        for pkg in &mut self.shared.list {
-            if let Some(&action) = change_map.get(&pkg.id) {
-                pkg.status = match action {
-                    ChangeAction::Install => PackageStatus::MarkedForInstall,
-                    ChangeAction::Upgrade => PackageStatus::MarkedForUpgrade,
-                    ChangeAction::Remove => PackageStatus::MarkedForRemove,
-                    ChangeAction::Downgrade => PackageStatus::MarkedForUpgrade,
-                };
-            }
-        }
-    }
-
-    /// Go back to modify marks (keeps marks, discards plan)
+    /// Go back to editing intents (discards the plan)
     pub fn modify(self) -> PackageManager<Dirty> {
-        PackageManager {
-            shared: self.shared,
-            state: Dirty,
-        }
+        self.with_state(Dirty)
     }
 
-    /// Commit the changes using caller-provided progress implementations
-    pub fn commit_with_progress(
+    /// Commit the plan. The cache is reloaded afterwards whatever happens,
+    /// which starts a new id generation and so ends in Clean state. The one
+    /// exception is a failure before anything was attempted (the cache could
+    /// not be opened), which leaves the plan in place.
+    pub fn commit(
         mut self,
         acquire_progress: &mut rust_apt::progress::AcquireProgress,
         install_progress: &mut rust_apt::progress::InstallProgress,
-    ) -> Result<PackageManager<Clean>> {
-        self.shared
-            .cache
-            .commit_with_progress(acquire_progress, install_progress)?;
-        self.shared.user_intent.clear();
-        self.shared.search.index = None;
-
-        Ok(PackageManager {
-            shared: self.shared,
-            state: Clean,
-        })
-    }
-}
-
-// ============================================================================
-// Shared functionality (all states)
-// ============================================================================
-
-impl<S: ReadableState> PackageManager<S> {
-    /// Get a package by index in current list
-    pub fn get_package(&self, index: usize) -> Option<&PackageInfo> {
-        self.shared.list.get(index)
-    }
-
-    /// Get number of packages in current list
-    pub fn package_count(&self) -> usize {
-        self.shared.list.len()
-    }
-
-    /// Check if a package is user-marked
-    pub fn is_user_marked(&self, id: PackageId) -> bool {
-        self.shared.user_intent.contains_key(&id)
-    }
-
-    /// Get current filter
-    pub fn selected_filter(&self) -> FilterCategory {
-        self.shared.selected_filter
-    }
-
-    /// Get upgradable count
-    pub fn upgradable_count(&self) -> usize {
-        self.shared.upgradable_count
-    }
-
-    /// Get search query
-    pub fn search_query(&self) -> &str {
-        &self.shared.search.query
-    }
-
-    /// Get search result count
-    pub fn search_result_count(&self) -> Option<usize> {
-        self.shared
-            .search
-            .results
-            .as_ref()
-            .map(std::collections::HashSet::len)
-    }
-
-    // === Filtering & Listing ===
-
-    /// Apply a filter category and rebuild the package list
-    pub fn apply_filter(&mut self, filter: FilterCategory) {
-        self.shared.selected_filter = filter;
-        self.rebuild_list();
-    }
-
-    /// Rebuild the package list based on current filter and search.
-    /// Uses per-filter memoization when no search is active to avoid
-    /// expensive FFI re-extraction on repeated filter switches.
-    /// The cache stores lists with BASE statuses only (no user_intent overlay);
-    /// the overlay is applied fresh on every restore so mark changes don't
-    /// require cache invalidation for non-MarkedChanges filters.
-    #[hotpath::measure]
-    pub fn rebuild_list(&mut self) -> ColumnWidths {
-        let filter = self.shared.selected_filter;
-        let has_search = self.shared.search.results.is_some();
-
-        // Cache hit: clone the cached base list (cache entry stays for reuse).
-        if !has_search
-            && let Some((cached_list, col_widths)) = self.shared.filter_cache.get(&filter)
-        {
-            self.shared.list = cached_list.clone();
-            let col_widths = col_widths.clone();
-            Self::apply_user_intent_overlay(&mut self.shared.list, &self.shared.user_intent);
-            self.sort_list();
-            return col_widths;
+    ) -> (ManagerState, Result<()>) {
+        if let Some(summary) = self.state.problems.errors.first() {
+            let err = eyre!("the plan has unresolved problems: {summary}");
+            return (ManagerState::Planned(self), Err(err));
         }
-
-        self.shared.list.clear();
-
-        let sort = if self.shared.selected_filter == FilterCategory::Upgradable {
-            PackageSort::default().upgradable()
-        } else {
-            PackageSort::default()
-        };
-
-        // First pass: collect package IDs that match filters
-        // (avoids borrow conflict between cache iteration and extract_package_info)
-        let matching_ids: Vec<PackageId> = {
-            let search_results = &self.shared.search.results;
-            let user_intent = &self.shared.user_intent;
-            let fullname_to_id = &self.shared.cache.fullname_to_id;
-
-            self.shared
-                .cache
-                .packages(&sort)
-                .filter(|pkg| {
-                    let matches_category = match self.shared.selected_filter {
-                        FilterCategory::Upgradable => pkg.is_upgradable(),
-                        FilterCategory::MarkedChanges => {
-                            // Check both user_intent (works in Dirty state) and
-                            // APT marks (works in Planned state for dependencies)
-                            let has_user_intent = fullname_to_id
-                                .get(&pkg.fullname(false))
-                                .map(|id| user_intent.contains_key(id))
-                                .unwrap_or(false);
-                            has_user_intent
-                                || pkg.marked_install()
-                                || pkg.marked_upgrade()
-                                || pkg.marked_delete()
-                        }
-                        FilterCategory::Installed => pkg.is_installed(),
-                        FilterCategory::NotInstalled => !pkg.is_installed(),
-                        FilterCategory::All => true,
-                    };
-
-                    let matches_search = match search_results {
-                        Some(results) => results.contains(pkg.name()),
-                        None => true,
-                    };
-
-                    matches_category && matches_search
-                })
-                .filter_map(|pkg| fullname_to_id.get(&pkg.fullname(false)).copied())
-                .collect()
-        };
-
-        // Second pass: extract full package info (base statuses only)
-        for id in matching_ids {
-            if let Some(info) = self
-                .shared
-                .cache
-                .get_by_id(id)
-                .and_then(|pkg| self.shared.cache.extract_package_info(&pkg))
-            {
-                self.shared.list.push(info);
-            }
+        let generation = self.shared.cache.generation();
+        let result = self.shared.cache.commit(acquire_progress, install_progress);
+        if self.shared.cache.generation() == generation {
+            return (ManagerState::Planned(self), result);
         }
-
-        // Calculate column widths from base data
-        let mut col_widths = ColumnWidths::new();
-        for pkg in &self.shared.list {
-            let display_len = self.shared.cache.display_name(&pkg.name).len() as u16;
-            col_widths.name = col_widths.name.max(display_len);
-            col_widths.section = col_widths.section.max(pkg.section.len() as u16);
-            col_widths.installed = col_widths.installed.max(pkg.installed_version.len() as u16);
-            col_widths.candidate = col_widths.candidate.max(pkg.candidate_version.len() as u16);
-        }
-
-        // Cache the base list (before user_intent overlay) for future switches
-        if !has_search {
-            self.shared
-                .filter_cache
-                .insert(filter, (self.shared.list.clone(), col_widths.clone()));
-        }
-
-        // Apply user_intent overlay after caching base data
-        Self::apply_user_intent_overlay(&mut self.shared.list, &self.shared.user_intent);
-
-        self.sort_list();
-        col_widths
-    }
-
-    /// Apply user_intent status overlay to a package list.
-    /// Converts base statuses (Installed/Upgradable/NotInstalled) to marked
-    /// statuses (MarkedForUpgrade/MarkedForInstall/etc) for packages in user_intent.
-    fn apply_user_intent_overlay(
-        list: &mut [PackageInfo],
-        user_intent: &HashMap<PackageId, UserIntent>,
-    ) {
-        for info in list.iter_mut() {
-            if let Some(&intent) = user_intent.get(&info.id) {
-                info.status = match intent {
-                    UserIntent::Install => {
-                        if info.status == PackageStatus::Upgradable {
-                            PackageStatus::MarkedForUpgrade
-                        } else {
-                            PackageStatus::MarkedForInstall
-                        }
-                    }
-                    UserIntent::Remove => PackageStatus::MarkedForRemove,
-                    UserIntent::Hold => PackageStatus::Keep,
-                    UserIntent::Default => info.status,
-                };
-            }
-        }
-    }
-
-    /// Sort the package list
-    fn sort_list(&mut self) {
-        let sort_by = self.shared.sort_settings.sort_by;
-        let ascending = self.shared.sort_settings.ascending;
-
-        self.shared.list.sort_by(|a, b| {
-            let ord = match sort_by {
-                SortBy::Name => a.name.cmp(&b.name),
-                SortBy::Section => a.section.cmp(&b.section),
-                SortBy::InstalledVersion => a.installed_version.cmp(&b.installed_version),
-                SortBy::CandidateVersion => a.candidate_version.cmp(&b.candidate_version),
-            };
-            if ascending { ord } else { ord.reverse() }
-        });
-    }
-
-    /// Update sort settings and re-sort
-    pub fn set_sort(&mut self, sort_by: SortBy, ascending: bool) {
-        self.shared.sort_settings.sort_by = sort_by;
-        self.shared.sort_settings.ascending = ascending;
-        self.sort_list();
-    }
-
-    // === Search ===
-
-    /// Ensure search index is built
-    pub fn ensure_search_index(&mut self) -> Result<std::time::Duration> {
-        if self.shared.search.index.is_none() {
-            let mut index = SearchIndex::new()?;
-            let (_count, duration) = index.build(&self.shared.cache)?;
-            self.shared.search.index = Some(index);
-            return Ok(duration);
-        }
-        Ok(std::time::Duration::ZERO)
-    }
-
-    /// Set search query and execute search
-    pub fn set_search_query(&mut self, query: &str) -> Result<()> {
-        self.shared.search.query = query.to_string();
-
-        if query.is_empty() {
-            self.shared.search.results = None;
-        } else if let Some(ref index) = self.shared.search.index {
-            self.shared.search.results = Some(index.search(query)?);
-        }
-        Ok(())
-    }
-
-    /// Clear search query and results
-    pub fn clear_search(&mut self) {
-        self.shared.search.query.clear();
-        self.shared.search.results = None;
-    }
-
-    // === Dependency Queries ===
-
-    /// Get forward dependencies for a package
-    pub fn get_dependencies(&self, name: &str) -> Vec<(String, String)> {
-        self.shared.cache.get_dependencies(name)
-    }
-
-    /// Get reverse dependencies for a package
-    pub fn get_reverse_dependencies(&self, name: &str) -> Vec<(String, String)> {
-        self.shared.cache.get_reverse_dependencies(name)
+        self.shared.forget_generation();
+        let mut clean = self.with_state(Clean);
+        clean.shared.rebuild_list(None);
+        (ManagerState::Clean(clean), result)
     }
 }
 
@@ -605,79 +478,138 @@ impl<S: ReadableState> PackageManager<S> {
 // Manager Wrapper (for TUI that can't hold consuming-self types)
 // ============================================================================
 
+/// Outcome of toggling a package with Space
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Toggle {
+    /// The package gained an Install intent
+    Marked,
+    /// The package's intent, or the intents that pulled it in, were removed
+    Unmarked,
+    /// The package is in the plan but no intent that explains it was found
+    NotUnmarkable,
+}
+
+/// Result of `ManagerState::diff_since()`: how the plan changed around the
+/// packages an action targeted.
+#[derive(Debug, Default)]
+pub struct PlanDiff {
+    /// Changes that are newly planned, excluding the acted-on packages
+    pub added: Vec<PlannedChange>,
+    /// Packages no longer planned, excluding the acted-on packages
+    pub dropped: Vec<PackageId>,
+    /// Download size of the newly planned changes and the acted-on packages
+    pub download_size: u64,
+}
+
 /// Wrapper enum that allows mutable access without consuming self
-/// This is necessary for TUI where we can't easily handle typestate transitions
 #[derive(Default)]
 pub enum ManagerState {
     Clean(PackageManager<Clean>),
     Dirty(PackageManager<Dirty>),
     Planned(PackageManager<Planned>),
-    /// Temporary placeholder used by `std::mem::take` during state transitions.
-    /// Must never be observed outside a `&mut self` method body.
-    /// SAFETY: Any method that `take`s self must assign `*self` back before
-    /// returning - including on error paths - or accessors will panic.
+    /// Placeholder that exists only inside `transition()`. Every transition
+    /// is infallible, so it is never observable from outside this module
+    /// unless a transition panics - which ends the program.
     #[default]
     Transitioning,
 }
 
 impl ManagerState {
-    /// Private helper: borrow the SharedState from any non-Transitioning variant.
-    fn shared(&self) -> &SharedState {
-        match self {
-            ManagerState::Clean(m) => &m.shared,
-            ManagerState::Dirty(m) => &m.shared,
-            ManagerState::Planned(m) => &m.shared,
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
-    }
-
-    /// Private helper: mutably borrow the SharedState from any non-Transitioning variant.
-    fn shared_mut(&mut self) -> &mut SharedState {
-        match self {
-            ManagerState::Clean(m) => &mut m.shared,
-            ManagerState::Dirty(m) => &mut m.shared,
-            ManagerState::Planned(m) => &mut m.shared,
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
-    }
-
     /// Create a new manager in Clean state
     pub fn new() -> Result<Self> {
         Ok(ManagerState::Clean(PackageManager::new()?))
     }
 
-    /// Get the planned changes (only valid in Planned state)
-    pub fn planned_changes(&self) -> Option<&[PlannedChange]> {
+    fn transition(&mut self, f: impl FnOnce(ManagerState) -> ManagerState) {
+        let old = std::mem::take(self);
+        *self = f(old);
+    }
+
+    fn shared(&self) -> &SharedState {
         match self {
-            ManagerState::Planned(m) => Some(m.changes()),
+            ManagerState::Clean(m) => &m.shared,
+            ManagerState::Dirty(m) => &m.shared,
+            ManagerState::Planned(m) => &m.shared,
+            ManagerState::Transitioning => unreachable!("Transitioning state observed"),
+        }
+    }
+
+    fn shared_mut(&mut self) -> &mut SharedState {
+        match self {
+            ManagerState::Clean(m) => &mut m.shared,
+            ManagerState::Dirty(m) => &mut m.shared,
+            ManagerState::Planned(m) => &mut m.shared,
+            ManagerState::Transitioning => unreachable!("Transitioning state observed"),
+        }
+    }
+
+    fn planned(&self) -> Option<&Planned> {
+        match self {
+            ManagerState::Planned(m) => Some(&m.state),
             _ => None,
         }
     }
 
-    /// Check if we have any user intent (marks)
-    pub fn has_marks(&self) -> bool {
-        !self.shared().user_intent.is_empty()
+    // === Plan accessors ===
+
+    /// The planned changes (only in Planned state)
+    pub fn planned_changes(&self) -> Option<&[PlannedChange]> {
+        self.planned().map(|p| p.changes.as_slice())
     }
 
-    // Accessor methods that work in any state
+    /// Ids of every planned change
+    pub fn planned_ids(&self) -> HashSet<PackageId> {
+        self.planned_changes()
+            .unwrap_or_default()
+            .iter()
+            .map(|c| c.package)
+            .collect()
+    }
 
-    pub fn user_mark_count(&self) -> usize {
-        self.shared().user_intent.len()
+    /// Resolver problems of the current plan
+    pub fn plan_problems(&self) -> Option<&PlanProblems> {
+        self.planned().map(|p| &p.problems)
+    }
+
+    /// True if there is a plan with no errors and at least one change
+    pub fn can_apply(&self) -> bool {
+        self.planned()
+            .is_some_and(|p| p.problems.errors.is_empty() && !p.changes.is_empty())
     }
 
     pub fn download_size(&self) -> u64 {
-        match self {
-            ManagerState::Planned(m) => m.state.download_size,
-            _ => 0,
-        }
+        self.planned().map_or(0, |p| p.download_size)
     }
 
     pub fn install_size_change(&self) -> i64 {
-        match self {
-            ManagerState::Planned(m) => m.state.install_size_change,
-            _ => 0,
-        }
+        self.planned().map_or(0, |p| p.install_size_change)
     }
+
+    // === Intent accessors ===
+
+    pub fn has_intents(&self) -> bool {
+        !self.shared().user_intent.is_empty()
+    }
+
+    pub fn intent_count(&self) -> usize {
+        self.shared().user_intent.len()
+    }
+
+    pub fn intent_of(&self, id: PackageId) -> Option<UserIntent> {
+        self.shared().user_intent.get(&id).copied()
+    }
+
+    /// Snapshot of all intents, for undo
+    pub fn intents(&self) -> IntentSnapshot {
+        self.shared().user_intent.clone()
+    }
+
+    /// APT failures that had no plan to report them in
+    pub fn take_apt_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.shared_mut().apt_errors)
+    }
+
+    // === List accessors ===
 
     pub fn list(&self) -> &[PackageInfo] {
         self.shared().list.as_slice()
@@ -691,10 +623,6 @@ impl ManagerState {
         self.shared().list.len()
     }
 
-    pub fn is_user_marked(&self, id: PackageId) -> bool {
-        self.shared().user_intent.contains_key(&id)
-    }
-
     pub fn selected_filter(&self) -> FilterCategory {
         self.shared().selected_filter
     }
@@ -703,57 +631,42 @@ impl ManagerState {
         self.shared().upgradable_count
     }
 
-    pub fn search_query(&self) -> &str {
-        &self.shared().search.query
-    }
-
-    pub fn search_result_count(&self) -> Option<usize> {
-        self.shared()
-            .search
-            .results
-            .as_ref()
-            .map(std::collections::HashSet::len)
-    }
-
-    pub fn get_dependencies(&self, name: &str) -> Vec<(String, String)> {
-        self.shared().cache.get_dependencies(name)
-    }
-
-    pub fn get_reverse_dependencies(&self, name: &str) -> Vec<(String, String)> {
-        self.shared().cache.get_reverse_dependencies(name)
-    }
-
-    pub fn fetch_changelog(&self, name: &str) -> Result<Vec<String>, String> {
-        match std::process::Command::new("apt")
-            .args(["changelog", name])
-            .output()
-        {
-            Ok(output) => {
-                if output.status.success() {
-                    let content = String::from_utf8_lossy(&output.stdout);
-                    let lines: Vec<String> = content
-                        .lines()
-                        .map(std::string::ToString::to_string)
-                        .collect();
-                    if lines.is_empty() {
-                        Ok(vec!["No changelog available.".to_string()])
-                    } else {
-                        Ok(lines)
-                    }
-                } else {
-                    let err = String::from_utf8_lossy(&output.stderr);
-                    Err(format!("Error: {err}"))
-                }
-            }
-            Err(e) => Err(format!("Failed to run apt changelog: {e}")),
+    /// Number of packages a filter shows (before search)
+    pub fn filter_count(&self, filter: FilterCategory) -> usize {
+        let shared = self.shared();
+        match filter {
+            FilterCategory::Upgradable => shared.upgradable_count,
+            FilterCategory::MarkedChanges => shared.marked_ids(self.planned_changes()).len(),
+            FilterCategory::Installed => shared.installed_count,
+            FilterCategory::NotInstalled => shared.total_count - shared.installed_count,
+            FilterCategory::All => shared.total_count,
         }
     }
 
-    // Mutating methods that work in any state
+    /// Get reference to the APT cache for name lookups
+    pub fn cache(&self) -> &AptCache {
+        &self.shared().cache
+    }
 
-    pub fn apply_filter(&mut self, filter: FilterCategory) {
-        self.shared_mut().selected_filter = filter;
-        self.rebuild_list();
+    pub fn get_dependencies(&self, fullname: &str) -> Vec<(DepType, String)> {
+        self.cache().get_dependencies(fullname)
+    }
+
+    pub fn get_reverse_dependencies(&self, fullname: &str) -> Vec<(DepType, String)> {
+        self.cache().get_reverse_dependencies(fullname)
+    }
+
+    // === List operations ===
+
+    /// Rebuild the list for the current filter, search and plan
+    #[hotpath::measure]
+    pub fn rebuild_list(&mut self) -> ColumnWidths {
+        match self {
+            ManagerState::Clean(m) => m.shared.rebuild_list(None),
+            ManagerState::Dirty(m) => m.shared.rebuild_list(None),
+            ManagerState::Planned(m) => m.shared.rebuild_list(Some(&m.state.changes)),
+            ManagerState::Transitioning => unreachable!("Transitioning state observed"),
+        }
     }
 
     /// Set the filter category without rebuilding the list.
@@ -762,545 +675,315 @@ impl ManagerState {
         self.shared_mut().selected_filter = filter;
     }
 
-    pub fn rebuild_list(&mut self) -> ColumnWidths {
-        match self {
-            ManagerState::Clean(m) => m.rebuild_list(),
-            ManagerState::Dirty(m) => m.rebuild_list(),
-            ManagerState::Planned(m) => {
-                let col_widths = m.rebuild_list();
-                // Apply planned changes to update statuses for dependencies
-                m.apply_planned_statuses();
-                col_widths
-            }
-            ManagerState::Transitioning => panic!("Transitioning state observed"),
-        }
-    }
-
-    /// Pre-warm the filter cache by building the list for all filters.
-    /// Called once at startup so subsequent filter switches are instant.
-    /// Restores the original filter afterwards.
-    pub fn pre_warm_filter_cache(&mut self) {
-        let original_filter = self.selected_filter();
-        for &filter in FilterCategory::all() {
-            if filter == original_filter {
-                continue; // Already built by initial refresh_ui_state
-            }
-            self.set_filter(filter);
-            self.rebuild_list();
-        }
-        // Restore original filter and rebuild
-        self.set_filter(original_filter);
-        self.rebuild_list();
-    }
-
-    pub fn set_sort(&mut self, sort_by: SortBy, ascending: bool) {
+    /// Update sort settings and re-sort the current list
+    pub fn set_sort(&mut self, sort: SortSettings) {
         let shared = self.shared_mut();
-        shared.sort_settings.sort_by = sort_by;
-        shared.sort_settings.ascending = ascending;
-        // Re-sort the current list in place
-        let asc = shared.sort_settings.ascending;
-        shared.list.sort_by(|a, b| {
-            let ord = match sort_by {
-                SortBy::Name => a.name.cmp(&b.name),
-                SortBy::Section => a.section.cmp(&b.section),
-                SortBy::InstalledVersion => a.installed_version.cmp(&b.installed_version),
-                SortBy::CandidateVersion => a.candidate_version.cmp(&b.candidate_version),
-            };
-            if asc { ord } else { ord.reverse() }
-        });
+        shared.sort = sort;
+        shared.sort_list();
     }
 
+    // === Search ===
+
+    /// Build the search index if it does not exist yet. Returns the build
+    /// time, or zero if it already existed.
     pub fn ensure_search_index(&mut self) -> Result<std::time::Duration> {
         let shared = self.shared_mut();
-        if shared.search.index.is_none() {
-            let mut index = SearchIndex::new()?;
-            let (_count, duration) = index.build(&shared.cache)?;
-            shared.search.index = Some(index);
-            return Ok(duration);
+        if shared.search.index.is_some() {
+            return Ok(std::time::Duration::ZERO);
         }
-        Ok(std::time::Duration::ZERO)
+        let start = std::time::Instant::now();
+        shared.search.index = Some(SearchIndex::build(&shared.cache)?);
+        Ok(start.elapsed())
     }
 
+    /// Set the search query and run it (does not rebuild the list)
     pub fn set_search_query(&mut self, query: &str) -> Result<()> {
-        let shared = self.shared_mut();
-        shared.search.query = query.to_string();
-        if query.is_empty() {
-            shared.search.results = None;
-        } else if let Some(ref index) = shared.search.index {
-            shared.search.results = Some(index.search(query)?);
-        }
-        Ok(())
+        self.shared_mut().set_search_query(query)
     }
 
-    pub fn clear_search(&mut self) {
-        let shared = self.shared_mut();
-        shared.search.query.clear();
-        shared.search.results = None;
+    pub fn search_query(&self) -> &str {
+        &self.shared().search.query
+    }
+
+    pub fn search_result_count(&self) -> Option<usize> {
+        self.shared().search.results.as_ref().map(HashSet::len)
     }
 
     pub fn has_search_results(&self) -> bool {
         self.shared().search.results.is_some()
     }
 
-    pub fn search_query_pop(&mut self) {
-        self.shared_mut().search.query.pop();
+    pub fn clear_search(&mut self) {
+        let search = &mut self.shared_mut().search;
+        search.query.clear();
+        search.results = None;
     }
 
-    pub fn search_query_push(&mut self, c: char) {
-        self.shared_mut().search.query.push(c);
-    }
+    // === Intent editing ===
 
-    pub fn refresh(&mut self) -> Result<(), String> {
-        let shared = self.shared_mut();
-        shared.cache.refresh().map_err(|e| e.to_string())?;
-        shared.user_intent.clear();
-        shared.filter_cache.clear();
-        shared.search.index = None;
-        shared.search.query.clear();
-        shared.search.results = None;
-        shared.compute_cache_counts();
-        // Transition to Clean to discard any stale Planned/Dirty state
-        self.reset();
-        Ok(())
-    }
-
-    pub fn update_cache_counts(&mut self) {
-        self.shared_mut().compute_cache_counts();
-    }
-
-    /// Get the count for a filter category
-    pub fn filter_count(&self, filter: FilterCategory) -> usize {
-        let shared = self.shared();
-        let (upgradable, installed, total, user_marks) = (
-            shared.upgradable_count,
-            shared.installed_count,
-            shared.total_count,
-            shared.user_intent.len(),
-        );
-
-        match filter {
-            FilterCategory::Upgradable => upgradable,
-            FilterCategory::MarkedChanges => {
-                // Include both user-marked and dependency-marked packages
-                // from planned_changes, not just user_intent count.
-                self.planned_changes()
-                    .map(<[PlannedChange]>::len)
-                    .unwrap_or(user_marks)
+    /// Apply intent edits (`None` clears an intent) and re-plan once.
+    /// Ends in Planned state, or Clean if no intents remain.
+    pub fn edit_intents(
+        &mut self,
+        edits: impl IntoIterator<Item = (PackageId, Option<UserIntent>)>,
+    ) {
+        self.transition(|state| {
+            let mut dirty = match state {
+                ManagerState::Clean(m) => m.edit(),
+                ManagerState::Dirty(m) => m,
+                ManagerState::Planned(m) => m.modify(),
+                ManagerState::Transitioning => unreachable!("Transitioning state observed"),
+            };
+            for (id, intent) in edits {
+                dirty = match intent {
+                    Some(intent) => dirty.set_intent(id, intent),
+                    None => dirty.clear_intent(id),
+                };
             }
-            FilterCategory::Installed => installed,
-            FilterCategory::NotInstalled => total - installed,
-            FilterCategory::All => total,
-        }
-    }
-
-    /// Mark all upgradable packages in the entire cache (not just filtered view)
-    pub fn mark_all_upgradable(&mut self) {
-        let upgradable_ids: Vec<PackageId> = {
-            let cache = self.cache();
-            cache
-                .packages(&PackageSort::default().upgradable())
-                .map(|pkg| pkg.fullname(false))
-                .filter_map(|name| cache.get_id(&name))
-                .collect()
-        };
-
-        for id in upgradable_ids {
-            self.mark_install(id);
-        }
-    }
-
-    /// Get reference to the APT cache for ID lookups
-    pub fn cache(&self) -> &AptCache {
-        &self.shared().cache
-    }
-}
-
-// ============================================================================
-// Macros for reducing boilerplate in ManagerState
-// ============================================================================
-
-/// Helper to take ownership and perform state transition
-impl ManagerState {
-    /// Mark a package for install, handling state transitions
-    pub fn mark_install(&mut self, id: PackageId) {
-        *self = match std::mem::take(self) {
-            ManagerState::Clean(m) => ManagerState::Dirty(m.mark_install(id)),
-            ManagerState::Dirty(m) => ManagerState::Dirty(m.mark_install(id)),
-            ManagerState::Planned(m) => ManagerState::Dirty(m.modify().mark_install(id)),
-            ManagerState::Transitioning => {
-                panic!("ManagerState::Transitioning should not be observed")
+            if dirty.has_intents() {
+                ManagerState::Planned(dirty.plan())
+            } else {
+                ManagerState::Clean(dirty.reset())
             }
-        };
+        });
     }
 
-    /// Unmark a package from user_intent (low-level, doesn't handle cascade).
-    /// For proper toggle behavior with cascade, use `toggle()` instead.
-    pub fn unmark(&mut self, id: PackageId) {
-        if !self.is_user_marked(id) {
-            return;
-        }
-
-        *self = match std::mem::take(self) {
-            ManagerState::Clean(m) => ManagerState::Clean(m),
-            ManagerState::Dirty(m) => ManagerState::Dirty(m.unmark(id)),
-            ManagerState::Planned(m) => ManagerState::Dirty(m.modify().unmark(id)),
-            ManagerState::Transitioning => {
-                panic!("ManagerState::Transitioning should not be observed")
-            }
-        };
-    }
-
-    /// Toggle a package's mark state with full cascade/orphan handling.
-    /// Returns (packages_affected, is_marking) for UI confirmation.
-    ///
-    /// - If not marked: marks it + computes plan (deps shown in plan)
-    /// - If marked (user or dep): unmarks with cascade, returns affected packages
-    #[hotpath::measure]
-    pub fn toggle(&mut self, id: PackageId) -> ToggleResult {
-        // First, compute plan if needed to know current marked state
-        self.compute_plan();
-
-        // Check if package is in the current planned change set.
-        // This covers user-marked and dependency-marked packages without
-        // a full rebuild_list() (which would iterate the entire APT cache).
-        let is_currently_marked = self
-            .planned_changes()
-            .is_some_and(|changes| changes.iter().any(|c| c.package == id));
-
-        if is_currently_marked {
-            // UNMARK flow
-            self.toggle_unmark(id)
-        } else {
-            // MARK flow
-            self.toggle_mark_impl(id)
-        }
-    }
-
-    /// Internal: handle marking a package
-    fn toggle_mark_impl(&mut self, id: PackageId) -> ToggleResult {
-        // Snapshot planned changes before marking (small set, not full list)
-        let planned_before: HashSet<PackageId> = self
-            .planned_changes()
-            .map(|changes| changes.iter().map(|c| c.package).collect())
-            .unwrap_or_default();
-
-        // Mark and compute plan
-        self.mark_install(id);
-        self.compute_plan();
-        self.rebuild_list();
-
-        // Find newly planned packages (deps) by diffing the small planned sets
-        let newly_marked: Vec<PackageId> = self
-            .planned_changes()
-            .map(|changes| {
-                changes
-                    .iter()
-                    .filter(|c| c.package != id && !planned_before.contains(&c.package))
-                    .map(|c| c.package)
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        ToggleResult::Marked {
-            package: id,
-            additional: newly_marked,
-        }
-    }
-
-    /// Internal: handle unmarking a package with cascade
-    fn toggle_unmark(&mut self, id: PackageId) -> ToggleResult {
-        // Snapshot planned changes before unmarking (small set, not full list)
-        let planned_before: HashSet<PackageId> = self
-            .planned_changes()
-            .map(|changes| changes.iter().map(|c| c.package).collect())
-            .unwrap_or_default();
-
-        // Determine what to remove from user_intent
-        let to_remove: Vec<PackageId> = if self.is_user_marked(id) {
-            vec![id]
-        } else {
-            // Package is a dependency: find user_intent packages that depend on it
-            self.find_user_intent_depending_on(id)
-        };
-
-        // Remove from user_intent
-        for pkg_id in &to_remove {
-            self.unmark(*pkg_id);
-        }
-
-        // Recompute plan (orphans automatically disappear)
-        self.compute_plan();
-        self.rebuild_list();
-
-        // Diff planned sets to find what got unmarked
-        let planned_after: HashSet<PackageId> = self
-            .planned_changes()
-            .map(|changes| changes.iter().map(|c| c.package).collect())
-            .unwrap_or_default();
-
-        // Check if the target package is still planned (unmark failed)
-        if planned_after.contains(&id) {
-            return ToggleResult::NoChange { package: id };
-        }
-
-        let also_unmarked: Vec<PackageId> = planned_before
-            .iter()
-            .filter(|pkg_id| !planned_after.contains(pkg_id) && **pkg_id != id)
-            .copied()
+    /// Replace all intents with a snapshot and re-plan
+    pub fn restore_intents(&mut self, snapshot: IntentSnapshot) {
+        let mut edits: Vec<(PackageId, Option<UserIntent>)> = self
+            .shared()
+            .user_intent
+            .keys()
+            .filter(|id| !snapshot.contains_key(id))
+            .map(|&id| (id, None))
             .collect();
-
-        ToggleResult::Unmarked {
-            package: id,
-            also_unmarked,
-        }
+        edits.extend(snapshot.into_iter().map(|(id, i)| (id, Some(i))));
+        self.edit_intents(edits);
     }
 
-    /// Find user_intent packages that (transitively) depend on the given package
-    fn find_user_intent_depending_on(&self, target_id: PackageId) -> Vec<PackageId> {
-        let cache = self.cache();
-        let target_name = match cache.fullname_of(target_id) {
-            Some(n) => n,
-            None => return Vec::new(),
-        };
-        let target_base = target_name.split(':').next().unwrap_or(target_name);
-
-        let mut result = Vec::new();
-
-        // Check each user_intent package
-        let intent_ids: Vec<PackageId> = self.user_intent_ids().copied().collect();
-
-        for intent_id in intent_ids {
-            if let Some(intent_name) = cache.fullname_of(intent_id)
-                && self.package_depends_on(intent_name, target_base)
-            {
-                result.push(intent_id);
-            }
-        }
-
-        result
-    }
-
-    /// Check if package A (transitively) depends on package B
-    fn package_depends_on(&self, pkg_name: &str, target_base: &str) -> bool {
-        let cache = self.cache();
-        let mut visited = HashSet::new();
-        let mut to_check = vec![pkg_name.to_string()];
-
-        while let Some(current) = to_check.pop() {
-            if visited.contains(&current) {
-                continue;
-            }
-            visited.insert(current.clone());
-
-            let deps = cache.get_dependencies(&current);
-            for (dep_type, dep_name) in deps {
-                if dep_type != "Depends" && dep_type != "PreDepends" {
-                    continue;
-                }
-
-                if dep_name == target_base {
-                    return true;
-                }
-
-                // Add to check list for transitive deps
-                if let Some(&dep_id) = cache.fullname_to_id.get(&dep_name).or_else(|| {
-                    cache
-                        .fullname_to_id
-                        .get(&format!("{}:{}", dep_name, cache.native_arch()))
-                }) && let Some(fullname) = cache.fullname_of(dep_id)
-                {
-                    to_check.push(fullname.to_string());
-                }
-            }
-        }
-
-        false
-    }
-
-    /// Get iterator over user_intent PackageIds
-    fn user_intent_ids(&self) -> impl Iterator<Item = &PackageId> {
-        self.shared().user_intent.keys()
-    }
-
-    /// Reset all marks
+    /// Drop every intent
     pub fn reset(&mut self) {
-        *self = match std::mem::take(self) {
+        self.transition(|state| match state {
             ManagerState::Clean(m) => ManagerState::Clean(m),
             ManagerState::Dirty(m) => ManagerState::Clean(m.reset()),
             ManagerState::Planned(m) => ManagerState::Clean(m.modify().reset()),
-            ManagerState::Transitioning => {
-                panic!("ManagerState::Transitioning should not be observed")
-            }
-        };
+            ManagerState::Transitioning => unreachable!("Transitioning state observed"),
+        });
     }
 
-    /// Compute plan from current marks
-    pub fn compute_plan(&mut self) {
-        *self = match std::mem::take(self) {
-            ManagerState::Clean(m) => ManagerState::Clean(m), // No marks, stay clean
-            ManagerState::Dirty(m) => {
-                let planned = m.plan();
-                ManagerState::Planned(planned)
-            }
-            ManagerState::Planned(m) => ManagerState::Planned(m), // Already planned
-            ManagerState::Transitioning => {
-                panic!("ManagerState::Transitioning should not be observed")
-            }
-        };
-        // Marks changed - invalidate MarkedChanges cache only.
-        // Other filters (Installed/Upgradable/etc) are unaffected by marks.
-        self.invalidate_filter_cache(Some(FilterCategory::MarkedChanges));
-    }
-
-    /// Invalidate per-filter memoization cache.
-    /// None = clear all entries; Some(filter) = clear only that filter.
-    fn invalidate_filter_cache(&mut self, filter: Option<FilterCategory>) {
-        // Transitioning is allowed here (no-op) since compute_plan() calls this
-        // after reassigning *self, but guard against edge cases.
-        if matches!(self, ManagerState::Transitioning) {
-            return;
+    /// Toggle a package with Space: clear its intent if it has one; if it is
+    /// only in the plan as a dependency, clear the intents that pulled it in;
+    /// otherwise mark it for install.
+    #[hotpath::measure]
+    pub fn toggle(&mut self, id: PackageId) -> Toggle {
+        if self.intent_of(id).is_some() {
+            self.edit_intents([(id, None)]);
+            return Toggle::Unmarked;
         }
-        let shared = self.shared_mut();
-        match filter {
-            Some(f) => {
-                shared.filter_cache.remove(&f);
-            }
-            None => shared.filter_cache.clear(),
+        if !self.planned_ids().contains(&id) {
+            self.edit_intents([(id, Some(UserIntent::Install))]);
+            return Toggle::Marked;
         }
+        let owners = self.intents_requiring(id);
+        if owners.is_empty() {
+            return Toggle::NotUnmarkable;
+        }
+        let undo = self.intents();
+        self.edit_intents(owners.into_iter().map(|o| (o, None)));
+        if self.planned_ids().contains(&id) {
+            self.restore_intents(undo);
+            return Toggle::NotUnmarkable;
+        }
+        Toggle::Unmarked
     }
 
-    /// Commit planned changes with caller-provided progress implementations.
+    /// Intents that (transitively) cause a planned dependency change.
     ///
-    /// NOTE: We split the take-match-assign into two phases so that a failed
-    /// commit never leaves `*self` as `Transitioning`. The inner commit
-    /// consumes the `PackageManager`, so on error we must reinitialize.
-    pub fn commit_with_progress(
+    /// A dependency install/upgrade is caused by Install intents whose
+    /// candidate dependencies reach it through other planned changes; a
+    /// dependency removal is caused by Remove intents that its installed
+    /// dependencies reach through other planned removals. Virtual packages
+    /// count via their providers. Changes forced by Conflicts/Breaks are not
+    /// traced.
+    fn intents_requiring(&self, target: PackageId) -> Vec<PackageId> {
+        let Some(changes) = self.planned_changes() else {
+            return Vec::new();
+        };
+        let actions: HashMap<PackageId, ChangeAction> =
+            changes.iter().map(|c| (c.package, c.action)).collect();
+        let Some(&target_action) = actions.get(&target) else {
+            return Vec::new();
+        };
+        let cache = self.cache();
+        let intents = &self.shared().user_intent;
+
+        if target_action == ChangeAction::Remove {
+            // Walk the target's installed dependencies through removals.
+            let reachable = reachable_from(target, |node| {
+                cache
+                    .dependency_ids(node, true)
+                    .into_iter()
+                    .filter(|d| actions.get(d) == Some(&ChangeAction::Remove))
+                    .collect()
+            });
+            return intents
+                .iter()
+                .filter(|&(id, &i)| i == UserIntent::Remove && reachable.contains(id))
+                .map(|(&id, _)| id)
+                .collect();
+        }
+
+        intents
+            .iter()
+            .filter(|&(_, &i)| i == UserIntent::Install)
+            .map(|(&id, _)| id)
+            .filter(|&owner| {
+                reachable_from(owner, |node| {
+                    cache
+                        .dependency_ids(node, false)
+                        .into_iter()
+                        .filter(|d| actions.get(d).is_some_and(|a| *a != ChangeAction::Remove))
+                        .collect()
+                })
+                .contains(&target)
+            })
+            .collect()
+    }
+
+    /// Mark every upgradable package without an intent for upgrade.
+    /// Returns how many were marked.
+    pub fn mark_all_upgradable(&mut self) -> usize {
+        let ids: Vec<PackageId> = {
+            let cache = self.cache();
+            let intents = &self.shared().user_intent;
+            cache
+                .packages(&PackageSort::default().upgradable())
+                .filter_map(|pkg| cache.id_of(&pkg))
+                .filter(|id| !intents.contains_key(id))
+                .collect()
+        };
+        let count = ids.len();
+        if count > 0 {
+            self.edit_intents(ids.into_iter().map(|id| (id, Some(UserIntent::Install))));
+        }
+        count
+    }
+
+    /// How the plan changed relative to `before` (the planned ids prior to
+    /// an action), ignoring the `acted` packages themselves.
+    pub fn diff_since(&self, before: &HashSet<PackageId>, acted: &HashSet<PackageId>) -> PlanDiff {
+        let changes = self.planned_changes().unwrap_or_default();
+        let after = self.planned_ids();
+        let mut diff = PlanDiff::default();
+        for change in changes {
+            if acted.contains(&change.package) {
+                if !before.contains(&change.package) {
+                    diff.download_size += change.download_size;
+                }
+            } else if !before.contains(&change.package) {
+                diff.download_size += change.download_size;
+                diff.added.push(change.clone());
+            }
+        }
+        diff.dropped = before
+            .iter()
+            .filter(|id| !after.contains(id) && !acted.contains(id))
+            .copied()
+            .collect();
+        diff
+    }
+
+    // === System operations ===
+
+    /// Commit the current plan. Refuses (and changes nothing) if the plan
+    /// has resolver errors.
+    pub fn commit(
         &mut self,
         acquire_progress: &mut rust_apt::progress::AcquireProgress,
         install_progress: &mut rust_apt::progress::InstallProgress,
     ) -> Result<()> {
-        let taken = std::mem::take(self);
-        let result = match taken {
-            ManagerState::Clean(m) => {
-                *self = ManagerState::Clean(m);
-                return Ok(());
+        let mut result = Ok(());
+        self.transition(|state| match state {
+            ManagerState::Planned(m) => {
+                let (next, r) = m.commit(acquire_progress, install_progress);
+                result = r;
+                next
             }
-            ManagerState::Dirty(m) => {
-                let planned = m.plan();
-                planned.commit_with_progress(acquire_progress, install_progress)
+            other => {
+                result = Err(eyre!("nothing to apply"));
+                other
             }
-            ManagerState::Planned(m) => m.commit_with_progress(acquire_progress, install_progress),
-            ManagerState::Transitioning => {
-                panic!("ManagerState::Transitioning should not be observed")
-            }
-        };
-        // *self is still Transitioning here - always assign before returning.
-        match result {
-            Ok(clean) => {
-                *self = ManagerState::Clean(clean);
-                Ok(())
-            }
-            Err(e) => {
-                // Inner PackageManager was consumed by the failed commit.
-                // Reinitialize a fresh cache so we don't leave Transitioning.
-                match ManagerState::new() {
-                    Ok(fresh) => *self = fresh,
-                    Err(reinit_err) => {
-                        // Double fault: commit failed AND cache won't reopen.
-                        // *self stays Transitioning - app cannot recover.
-                        return Err(e.wrap_err(format!(
-                            "additionally, failed to reinitialize package cache: {reinit_err}"
-                        )));
-                    }
-                }
-                Err(e)
-            }
-        }
+        });
+        result
     }
 
-    /// Run `apt update` with caller-provided progress
-    pub fn update_with_progress(
+    /// Run `apt update`, then reload. Intents are carried across the reload
+    /// by package name and re-planned; returns the names of intents whose
+    /// package no longer exists. On failure the cache is still reloaded
+    /// (lists may be partially updated) unless it could not be reopened.
+    pub fn update(
         &mut self,
         acquire_progress: &mut rust_apt::progress::AcquireProgress,
-    ) -> Result<(), String> {
-        let shared = self.shared_mut();
-        shared
-            .cache
-            .update_with_progress(acquire_progress)
-            .map_err(|e| e.to_string())?;
-        shared.user_intent.clear();
-        shared.filter_cache.clear();
-        shared.search.index = None;
-        shared.search.query.clear();
-        shared.search.results = None;
-        shared.compute_cache_counts();
-        // Transition to Clean to discard any stale Planned/Dirty state
-        self.reset();
-        Ok(())
-    }
+    ) -> (Vec<String>, Result<()>) {
+        let generation = self.cache().generation();
+        let carried: Vec<(String, UserIntent)> = {
+            let cache = self.cache();
+            self.shared()
+                .user_intent
+                .iter()
+                .filter_map(|(&id, &i)| Some((cache.fullname_of(id)?.to_string(), i)))
+                .collect()
+        };
 
-    /// Build a MarkPreview from the current Planned state's changes.
-    /// Call this after marking a package and computing the plan.
-    /// `previously_planned` contains PackageIds that were already in the plan
-    /// before this mark - they are excluded from the "additional" lists.
-    pub fn build_mark_preview(
-        &self,
-        marked_pkg_id: PackageId,
-        previously_planned: &HashSet<PackageId>,
-    ) -> Option<MarkPreview> {
-        let changes = self.planned_changes()?;
-        let cache = self.cache();
-
-        // Use display name (strips native arch suffix)
-        let marked_pkg_name = cache
-            .fullname_of(marked_pkg_id)
-            .map(|n| cache.display_name(n).to_string())?;
-
-        let mut additional_installs = Vec::new();
-        let mut additional_upgrades = Vec::new();
-        let mut additional_removes = Vec::new();
-        let mut download_size = 0u64;
-        let mut is_upgrade = false;
-
-        for change in changes {
-            // Check if the marked package is an upgrade vs install
-            if change.package == marked_pkg_id {
-                download_size += change.download_size;
-                is_upgrade = change.action == ChangeAction::Upgrade;
-                continue;
-            }
-
-            // Skip packages that were already planned before this mark
-            if previously_planned.contains(&change.package) {
-                continue;
-            }
-
-            download_size += change.download_size;
-
-            // Derive display name from PackageId (strips native arch suffix)
-            let name = cache
-                .fullname_of(change.package)
-                .map(|n| cache.display_name(n).to_string())
-                .unwrap_or_else(|| format!("(unknown:{})", change.package.index()));
-
-            match change.action {
-                ChangeAction::Install => additional_installs.push(name),
-                ChangeAction::Upgrade => additional_upgrades.push(name),
-                ChangeAction::Remove => additional_removes.push(name),
-                ChangeAction::Downgrade => additional_upgrades.push(name),
-            }
+        let result = self.shared_mut().cache.update(acquire_progress);
+        if self.cache().generation() == generation {
+            return (Vec::new(), result);
         }
 
-        Some(MarkPreview::Mark {
-            package_name: marked_pkg_name,
-            is_upgrade,
-            additional_installs,
-            additional_upgrades,
-            additional_removes,
-            download_size,
-            bulk_acted_ids: Vec::new(),
-        })
+        self.transition(|state| {
+            let mut shared = match state {
+                ManagerState::Clean(m) => m.shared,
+                ManagerState::Dirty(m) => m.shared,
+                ManagerState::Planned(m) => m.shared,
+                ManagerState::Transitioning => unreachable!("Transitioning state observed"),
+            };
+            shared.forget_generation();
+            ManagerState::Clean(PackageManager {
+                shared,
+                state: Clean,
+            })
+        });
+
+        let mut lost = Vec::new();
+        let mut edits = Vec::new();
+        for (name, intent) in carried {
+            match self.cache().get_id(&name) {
+                Some(id) => edits.push((id, Some(intent))),
+                None => lost.push(self.cache().display_name(&name).to_string()),
+            }
+        }
+        if !edits.is_empty() {
+            self.edit_intents(edits);
+        }
+        (lost, result)
     }
+}
+
+/// Every node reachable from `start` (inclusive) via `next`.
+fn reachable_from(
+    start: PackageId,
+    mut next: impl FnMut(PackageId) -> Vec<PackageId>,
+) -> HashSet<PackageId> {
+    let mut seen = HashSet::from([start]);
+    let mut stack = vec![start];
+    while let Some(node) = stack.pop() {
+        for n in next(node) {
+            if seen.insert(n) {
+                stack.push(n);
+            }
+        }
+    }
+    seen
 }
 
 // ============================================================================
@@ -1312,25 +995,108 @@ pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-/// Check if APT lock files are held by another process
-pub fn check_apt_lock() -> Option<String> {
-    let lock_paths = [
-        "/var/lib/dpkg/lock-frontend",
-        "/var/lib/dpkg/lock",
-        "/var/lib/apt/lists/lock",
-    ];
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    for path in &lock_paths {
-        if let Ok(file) = File::open(path) {
-            let fd = file.as_raw_fd();
-            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-            if ret != 0 {
-                return Some(format!(
-                    "Another package manager is running ({path}). Close it and try again."
-                ));
-            }
-            unsafe { libc::flock(fd, libc::LOCK_UN) };
+    fn info(id: u32, status: PackageStatus) -> PackageInfo {
+        PackageInfo {
+            id: PackageId(id),
+            name: format!("pkg{id}"),
+            status,
+            section: String::new(),
+            installed_version: String::new(),
+            candidate_version: String::new(),
+            installed_size: 0,
+            download_size: 0,
+            description: String::new(),
+            architecture: String::new(),
         }
     }
-    None
+
+    #[test]
+    fn overlay_intents_then_plan() {
+        let mut list = vec![
+            info(0, PackageStatus::Upgradable),
+            info(1, PackageStatus::NotInstalled),
+            info(2, PackageStatus::Installed),
+            info(3, PackageStatus::Installed),
+            info(4, PackageStatus::Installed),
+        ];
+        let intents = HashMap::from([
+            (PackageId(0), UserIntent::Install),
+            (PackageId(1), UserIntent::Install),
+            (PackageId(2), UserIntent::Hold),
+            (PackageId(3), UserIntent::Remove),
+        ]);
+        let planned = [PlannedChange {
+            package: PackageId(4),
+            action: ChangeAction::Remove,
+            reason: ChangeReason::Dependency,
+            download_size: 0,
+            size_change: 0,
+        }];
+        overlay_statuses(&mut list, &intents, Some(&planned));
+        let statuses: Vec<_> = list.iter().map(|p| p.status).collect();
+        assert_eq!(
+            statuses,
+            [
+                PackageStatus::MarkedForUpgrade,
+                PackageStatus::MarkedForInstall,
+                PackageStatus::Held,
+                PackageStatus::MarkedForRemove,
+                PackageStatus::MarkedForRemove,
+            ]
+        );
+    }
+
+    #[test]
+    fn upgrade_size_is_a_delta() {
+        let new = Some((5_000, 101_000_000));
+        assert_eq!(
+            change_sizes(ChangeAction::Upgrade, new, Some(100_000_000)),
+            (5_000, 1_000_000)
+        );
+        assert_eq!(
+            change_sizes(ChangeAction::Install, new, None),
+            (5_000, 101_000_000)
+        );
+        assert_eq!(
+            change_sizes(ChangeAction::Remove, new, Some(100_000_000)),
+            (0, -100_000_000)
+        );
+        assert_eq!(
+            change_sizes(ChangeAction::Reinstall, new, Some(1)),
+            (5_000, 0)
+        );
+    }
+
+    #[test]
+    fn version_sort_with_missing_versions() {
+        let mut a = info(0, PackageStatus::Installed);
+        let mut b = info(1, PackageStatus::Installed);
+        a.installed_version = "10.0".into();
+        b.installed_version = "9.0".into();
+        assert_eq!(
+            compare_packages(&a, &b, SortBy::InstalledVersion),
+            Ordering::Greater
+        );
+        b.installed_version.clear();
+        assert_eq!(
+            compare_packages(&a, &b, SortBy::InstalledVersion),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn reachable_follows_edges_once() {
+        let edges = HashMap::from([(0u32, vec![1, 2]), (1, vec![2, 0]), (2, vec![3])]);
+        let seen = reachable_from(PackageId(0), |n| {
+            edges
+                .get(&n.0)
+                .map(|v| v.iter().map(|&i| PackageId(i)).collect())
+                .unwrap_or_default()
+        });
+        assert_eq!(seen.len(), 4);
+    }
 }

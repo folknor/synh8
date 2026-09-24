@@ -7,6 +7,8 @@ use ratatui::widgets::{
 };
 
 use crate::app::App;
+use synh8::keymap::{self, Action, Context};
+use synh8::progress::centered_rect;
 use synh8::types::*;
 
 #[hotpath::measure]
@@ -21,26 +23,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         ])
         .split(frame.area());
 
-    // Get download size from planned changes if available
-    let changes_count = app.total_changes_count();
-    let title_text = if changes_count > 0 {
-        let download_size = app.core.download_size();
-        format!(
-            " APT TUI │ {} changes │ {} download ",
-            changes_count,
-            PackageInfo::size_str(download_size)
-        )
-    } else if app.core.has_marks() {
-        format!(
-            " APT TUI │ {} marked (press 'a' to apply) ",
-            app.core.user_mark_count()
-        )
-    } else {
-        " APT TUI │ No changes pending ".to_string()
-    };
-    let title =
-        Paragraph::new(title_text).style(Style::default().fg(Color::White).bg(Color::Blue).bold());
-    frame.render_widget(title, main_chunks[0]);
+    render_title(frame, app, main_chunks[0]);
 
     match app.state {
         AppState::Listing
@@ -61,111 +44,90 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             render_package_table(frame, app, panes[1]);
             render_details_pane(frame, app, panes[2]);
 
-            // Modal overlays on top of three-pane layout
             match app.state {
                 AppState::ShowingMarkConfirm => {
                     render_mark_preview_modal(frame, app, main_chunks[1]);
                 }
-                AppState::ConfirmExit => render_exit_confirm_modal(frame, app, main_chunks[1]),
+                AppState::ConfirmExit => render_exit_confirm_modal(frame, main_chunks[1]),
                 _ => {}
             }
         }
-        AppState::ShowingChanges => {
-            render_changes_modal(frame, app, main_chunks[1]);
-        }
-        AppState::ShowingChangelog => {
-            render_changelog_view(frame, app, main_chunks[1]);
-        }
-        AppState::ShowingSettings => {
-            render_settings_view(frame, app, main_chunks[1]);
-        }
-        AppState::Upgrading | AppState::Done => {
-            let lines: Vec<Line> = app
-                .output_lines
-                .iter()
-                .map(|s| Line::from(s.as_str()))
-                .collect();
-            let output = Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .title(" APT Output ")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Green)),
-                )
-                .wrap(Wrap { trim: false })
-                .scroll((app.output_scroll, 0));
-            frame.render_widget(output, main_chunks[1]);
-        }
+        AppState::ShowingChanges => render_changes_modal(frame, app, main_chunks[1]),
+        AppState::ShowingChangelog => render_changelog_view(frame, app, main_chunks[1]),
+        AppState::ShowingSettings => render_settings_view(frame, app, main_chunks[1]),
+        AppState::Done => render_output_view(frame, app, main_chunks[1]),
     }
 
+    render_status_bar(frame, app, main_chunks[2]);
+
+    let mut help_stack = app.help_contexts();
+    if app.state == AppState::Listing && !app.ui.visual_mode {
+        help_stack.push(Context::Global);
+    }
+    let help = Paragraph::new(keymap::help_line(&help_stack))
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center);
+    frame.render_widget(help, main_chunks[3]);
+}
+
+fn render_title(frame: &mut Frame, app: &App, area: Rect) {
+    let changes_count = app.core.planned_changes().map_or(0, <[_]>::len);
+    let title_text = if changes_count > 0 {
+        format!(
+            " synh8 │ {} changes │ {} download ",
+            changes_count,
+            size_str(app.core.download_size())
+        )
+    } else if app.core.has_intents() {
+        format!(" synh8 │ {} marked ", app.core.intent_count())
+    } else {
+        " synh8 │ No changes pending ".to_string()
+    };
+    let title =
+        Paragraph::new(title_text).style(Style::default().fg(Color::White).bg(Color::Blue).bold());
+    frame.render_widget(title, area);
+}
+
+fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let status_style = match app.state {
-        AppState::Listing => Style::default().fg(Color::Yellow),
+        AppState::Listing | AppState::ShowingSettings => Style::default().fg(Color::Yellow),
         AppState::Searching => Style::default().fg(Color::White),
         AppState::ShowingMarkConfirm => Style::default().fg(Color::Magenta),
-        AppState::ShowingChanges => Style::default().fg(Color::Cyan),
-        AppState::ShowingChangelog => Style::default().fg(Color::Cyan),
-        AppState::ShowingSettings => Style::default().fg(Color::Yellow),
+        AppState::ShowingChanges | AppState::ShowingChangelog => Style::default().fg(Color::Cyan),
         AppState::ConfirmExit => Style::default().fg(Color::Red),
-        AppState::Upgrading => Style::default().fg(Color::Cyan),
         AppState::Done => Style::default().fg(Color::Green),
     };
 
-    let status_text: std::borrow::Cow<str> = match app.state {
-        AppState::Searching => format!("/{}_", app.core.search_query()).into(),
-        _ => {
-            if app.core.search_result_count().is_some() {
-                format!(
-                    "[Search: {}] {}",
-                    app.core.search_query(),
-                    app.status_message
-                )
-                .into()
-            } else {
-                (&*app.status_message).into()
-            }
-        }
+    let status_text = match app.state {
+        AppState::Searching => format!("/{}", app.core.search_query()),
+        _ if app.core.has_search_results() => format!(
+            "[Search: {}] {}",
+            app.core.search_query(),
+            app.status_message
+        ),
+        _ => app.status_message.clone(),
     };
     let status = Paragraph::new(status_text)
         .style(status_style)
         .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(status, main_chunks[2]);
+    frame.render_widget(status, area);
 
-    let help_text = match app.state {
-        AppState::Listing => {
-            if app.ui.visual_mode {
-                "v/Space:Mark selected │ Esc:Cancel │ ↑↓:Extend selection"
-            } else if app.core.search_result_count().is_some() {
-                "Esc:Clear search │ Space:Mark │ v:Visual │ x:All │ z:None │ a:Apply │ q:Quit"
-            } else {
-                "s:Search │ Space:Mark │ v:Visual │ x:All │ z:None │ a:Apply │ F2:Settings │ q:Quit"
-            }
-        }
-        AppState::Searching => "Enter:Confirm │ Esc:Cancel │ Type to search...",
-        AppState::ShowingMarkConfirm => "Space:Confirm │ Esc:Cancel",
-        AppState::ShowingChanges => "Space:Apply │ Esc:Cancel │ ↑↓:Scroll",
-        AppState::ShowingChangelog => "↑↓:Scroll │ Esc/Space:Close",
-        AppState::ShowingSettings => "↑↓:Navigate │ Space:Toggle │ Esc:Close",
-        AppState::ConfirmExit => "Space:Quit │ Esc:Cancel",
-        AppState::Upgrading => "Applying changes...",
-        AppState::Done => "↑↓:Scroll │ Space:Continue │ Esc:Continue",
-    };
-    let help = Paragraph::new(help_text)
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(Alignment::Center);
-    frame.render_widget(help, main_chunks[3]);
-
-    // Show cursor for text input states
     if app.state == AppState::Searching {
-        // Cursor after "/<query>" in the status bar (inside border: +1 x, +1 y)
-        let cursor_x = main_chunks[2].x + 1 + 1 + app.core.search_query().len() as u16;
-        let cursor_y = main_chunks[2].y + 1;
-        frame.set_cursor_position((cursor_x, cursor_y));
+        // Cursor after "/<query>" inside the border
+        let query_width = Line::from(app.core.search_query()).width() as u16;
+        frame.set_cursor_position((area.x + 2 + query_width, area.y + 1));
+    }
+}
+
+fn pane_border(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
     }
 }
 
 fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
-    let is_focused = app.ui.focused_pane == FocusedPane::Filters;
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(7), Constraint::Length(9)])
@@ -174,8 +136,7 @@ fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = FilterCategory::all()
         .iter()
         .map(|cat| {
-            let count = app.core.filter_count(*cat);
-            let label = format!("{} ({})", cat.label(), count);
+            let label = format!("{} ({})", cat.label(), app.core.filter_count(*cat));
             let style = if *cat == app.core.selected_filter() {
                 Style::default().fg(Color::Yellow).bold()
             } else {
@@ -185,18 +146,12 @@ fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    let border_style = if is_focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
     let list = List::new(items)
         .block(
             Block::default()
                 .title(" Filters ")
                 .borders(Borders::ALL)
-                .border_style(border_style),
+                .border_style(pane_border(app.ui.focused_pane == FocusedPane::Filters)),
         )
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("▶ ");
@@ -246,7 +201,6 @@ fn render_filter_pane(frame: &mut Frame, app: &mut App, area: Rect) {
 
 #[hotpath::measure]
 fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
-    let is_focused = app.ui.focused_pane == FocusedPane::Packages;
     let visible_cols = Column::visible_columns(&app.settings);
 
     let header_cells: Vec<Cell> = visible_cols
@@ -255,24 +209,23 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     let header = Row::new(header_cells).height(1);
 
+    // Visible window: area height minus 2 borders minus the header row.
+    let visible_rows = area.height.saturating_sub(3) as usize;
+    if app.ui.table_visible_rows != visible_rows {
+        app.ui.table_visible_rows = visible_rows;
+        app.center_scroll_offset();
+    }
+
     let list = app.core.list();
     let total_count = list.len();
 
-    // Compute visible window - use for both slicing and scroll feedback.
-    // area.height minus 2 (borders) minus 1 (header row).
-    let visible_rows = area.height.saturating_sub(3) as usize;
-    app.ui.table_visible_rows = visible_rows;
-
     // Read absolute offset from app state (set by center_scroll_offset).
     // Clamp to handle stale offsets when the list shrinks between frames.
-    let offset = if total_count == 0 {
-        0
-    } else {
-        app.ui
-            .table_state
-            .offset()
-            .min(total_count.saturating_sub(1))
-    };
+    let offset = app
+        .ui
+        .table_state
+        .offset()
+        .min(total_count.saturating_sub(1));
     let end = (offset + visible_rows).min(total_count);
     let visible_slice = &list[offset..end];
 
@@ -285,8 +238,8 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
             let is_multi_selected = app
                 .ui
                 .visual_range
-                .is_some_and(|(start, end)| abs_idx >= start && abs_idx <= end);
-            let is_user_marked = app.core.is_user_marked(pkg.id);
+                .is_some_and(|(start, end)| (start..=end).contains(&abs_idx));
+            let is_user_marked = app.core.intent_of(pkg.id).is_some();
 
             let cells: Vec<Cell> = visible_cols
                 .iter()
@@ -299,9 +252,7 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
                         } else {
                             Style::default()
                         };
-                        // Strip native arch suffix for cleaner display
-                        let display_name = app.core.cache().display_name(&pkg.name);
-                        Cell::from(display_name).style(style)
+                        Cell::from(app.core.cache().display_name(&pkg.name)).style(style)
                     }
                     Column::Section => Cell::from(pkg.section.as_str()),
                     Column::InstalledVersion => {
@@ -331,21 +282,14 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|col| col.width(&app.col_widths))
         .collect();
 
-    let border_style = if is_focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
     // Temporary TableState for the sliced row set: offset = 0, selection
     // translated to slice-relative index. Never written back to app state.
-    let relative_selected = app.ui.table_state.selected().and_then(|abs| {
-        if abs >= offset && abs < end {
-            Some(abs - offset)
-        } else {
-            None
-        }
-    });
+    let relative_selected = app
+        .ui
+        .table_state
+        .selected()
+        .filter(|abs| (offset..end).contains(abs))
+        .map(|abs| abs - offset);
     let mut temp_table_state = TableState::default();
     temp_table_state.select(relative_selected);
 
@@ -355,7 +299,7 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
             Block::default()
                 .title(format!(" Packages ({total_count}) "))
                 .borders(Borders::ALL)
-                .border_style(border_style),
+                .border_style(pane_border(app.ui.focused_pane == FocusedPane::Packages)),
         )
         .row_highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("▶ ");
@@ -363,7 +307,7 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut temp_table_state);
 
     // Scrollbar uses absolute indices from the original app table state.
-    if total_count > 0 {
+    if total_count > 0 && area.width > 0 {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("↑"))
             .end_symbol(Some("↓"));
@@ -381,97 +325,116 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
-    let is_focused = app.ui.focused_pane == FocusedPane::Details;
+/// Render a bordered, wrapped, scrollable paragraph, recording its real
+/// viewport and (wrapped) content height in `scroll`.
+fn render_scrollable(
+    frame: &mut Frame,
+    area: Rect,
+    block: Block,
+    lines: Vec<Line>,
+    scroll: &mut ScrollView,
+) {
+    let inner = block.inner(area);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    scroll.measure(inner.height as usize, paragraph.line_count(inner.width));
+    frame.render_widget(block, area);
+    frame.render_widget(paragraph.scroll((scroll.offset_u16(), 0)), inner);
+}
 
-    let border_style = if is_focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
+fn heading(text: String) -> Line<'static> {
+    Line::from(Span::styled(text, Style::default().fg(Color::Cyan).bold()))
+}
 
-    let info_style = if app.details.tab == DetailsTab::Info {
-        Style::default().fg(Color::Yellow).bold()
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let deps_style = if app.details.tab == DetailsTab::Dependencies {
-        Style::default().fg(Color::Yellow).bold()
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let rdeps_style = if app.details.tab == DetailsTab::ReverseDeps {
-        Style::default().fg(Color::Yellow).bold()
-    } else {
-        Style::default().fg(Color::DarkGray)
+fn dep_lines(deps: &[(rust_apt::DepType, String)]) -> Vec<Line<'_>> {
+    let mut lines = Vec::new();
+    let mut current: Option<&rust_apt::DepType> = None;
+    for (dep_type, target) in deps {
+        if current != Some(dep_type) {
+            if current.is_some() {
+                lines.push(Line::from(""));
+            }
+            lines.push(heading(format!("{dep_type}:")));
+            current = Some(dep_type);
+        }
+        lines.push(Line::from(format!("  {target}")));
+    }
+    lines
+}
+
+fn render_details_pane(frame: &mut Frame, app: &mut App, area: Rect) {
+    let tab_style = |tab| {
+        if app.details.tab == tab {
+            Style::default().fg(Color::Yellow).bold()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
     };
 
     let mut content = vec![
         Line::from(vec![
-            Span::styled("[Info]", info_style),
+            Span::styled("[Info]", tab_style(DetailsTab::Info)),
             Span::raw(" "),
-            Span::styled("[Deps]", deps_style),
+            Span::styled("[Deps]", tab_style(DetailsTab::Dependencies)),
             Span::raw(" "),
-            Span::styled("[RDeps]", rdeps_style),
+            Span::styled("[RDeps]", tab_style(DetailsTab::ReverseDeps)),
         ]),
         Line::from(Span::styled(
-            "  (d to switch)",
+            format!(
+                "  ({} / {} to switch)",
+                keymap::key_label(Context::Details, Action::PrevTab),
+                keymap::key_label(Context::Details, Action::NextTab)
+            ),
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
     ];
 
-    if let Some(pkg) = app.selected_package() {
-        let display_name = app.core.cache().display_name(&pkg.name);
-        match app.details.tab {
+    match app.selected_package() {
+        None => content.push(Line::from(Span::styled(
+            "No package selected",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        Some(pkg) => match app.details.tab {
             DetailsTab::Info => {
-                content.extend(vec![
+                let field = |name: &'static str, value: String| {
+                    Line::from(vec![
+                        Span::styled(name, Style::default().fg(Color::Cyan)),
+                        Span::raw(value),
+                    ])
+                };
+                let installed = if pkg.installed_version.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    pkg.installed_version.clone()
+                };
+                content.extend([
                     Line::from(vec![
                         Span::styled("Package: ", Style::default().fg(Color::Cyan).bold()),
-                        Span::raw(display_name),
+                        Span::raw(app.core.cache().display_name(&pkg.name).to_string()),
                     ]),
                     Line::from(""),
                     Line::from(vec![
                         Span::styled("Status: ", Style::default().fg(Color::Cyan)),
                         Span::styled(pkg.status.symbol(), Style::default().fg(pkg.status.color())),
-                        Span::raw(format!(" {:?}", pkg.status)),
+                        Span::raw(format!(" {}", pkg.status.label())),
                     ]),
-                    Line::from(vec![
-                        Span::styled("Section: ", Style::default().fg(Color::Cyan)),
-                        Span::raw(&pkg.section),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("Arch: ", Style::default().fg(Color::Cyan)),
-                        Span::raw(&pkg.architecture),
-                    ]),
+                    field("Section: ", pkg.section.clone()),
+                    field("Arch: ", pkg.architecture.clone()),
                     Line::from(""),
-                    Line::from(vec![
-                        Span::styled("Installed: ", Style::default().fg(Color::Cyan)),
-                        Span::raw(if pkg.installed_version.is_empty() {
-                            "(none)"
-                        } else {
-                            &pkg.installed_version
-                        }),
-                    ]),
+                    field("Installed: ", installed),
                     Line::from(vec![
                         Span::styled("Candidate: ", Style::default().fg(Color::Green)),
-                        Span::raw(&pkg.candidate_version),
+                        Span::raw(pkg.candidate_version.clone()),
                     ]),
                     Line::from(""),
-                    Line::from(vec![
-                        Span::styled("Download: ", Style::default().fg(Color::Cyan)),
-                        Span::raw(pkg.download_size_str()),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("Inst Size: ", Style::default().fg(Color::Cyan)),
-                        Span::raw(pkg.installed_size_str()),
-                    ]),
+                    field("Download: ", pkg.download_size_str()),
+                    field("Inst Size: ", pkg.installed_size_str()),
                     Line::from(""),
                     Line::from(Span::styled(
                         "Description:",
                         Style::default().fg(Color::Cyan).bold(),
                     )),
-                    Line::from(pkg.description.as_str()),
+                    Line::from(pkg.description.clone()),
                 ]);
             }
             DetailsTab::Dependencies => {
@@ -481,25 +444,7 @@ fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(Color::DarkGray),
                     )));
                 } else {
-                    let mut current_type = String::new();
-
-                    for (dep_type, target) in &app.details.cached_deps {
-                        if dep_type != &current_type {
-                            if !current_type.is_empty() {
-                                content.push(Line::from(""));
-                            }
-                            content.push(Line::from(Span::styled(
-                                format!("{dep_type}:"),
-                                Style::default().fg(Color::Cyan).bold(),
-                            )));
-                            current_type = dep_type.clone();
-                        }
-
-                        content.push(Line::from(vec![
-                            Span::raw("  "),
-                            Span::raw(target.as_str()),
-                        ]));
-                    }
+                    content.extend(dep_lines(&app.details.cached_deps));
                 }
             }
             DetailsTab::ReverseDeps => {
@@ -509,42 +454,15 @@ fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(Color::DarkGray),
                     )));
                 } else {
-                    content.push(Line::from(Span::styled(
-                        format!(
-                            "{} packages depend on this:",
-                            app.details.cached_rdeps.len()
-                        ),
-                        Style::default().fg(Color::Cyan).bold(),
+                    content.push(heading(format!(
+                        "{} packages depend on this:",
+                        app.details.cached_rdeps.len()
                     )));
                     content.push(Line::from(""));
-
-                    let mut current_type = String::new();
-
-                    for (dep_type, pkg_name) in &app.details.cached_rdeps {
-                        if dep_type != &current_type {
-                            if !current_type.is_empty() {
-                                content.push(Line::from(""));
-                            }
-                            content.push(Line::from(Span::styled(
-                                format!("{dep_type}:"),
-                                Style::default().fg(Color::Cyan).bold(),
-                            )));
-                            current_type = dep_type.clone();
-                        }
-
-                        content.push(Line::from(vec![
-                            Span::raw("  "),
-                            Span::raw(pkg_name.as_str()),
-                        ]));
-                    }
+                    content.extend(dep_lines(&app.details.cached_rdeps));
                 }
             }
-        }
-    } else {
-        content.push(Line::from(Span::styled(
-            "No package selected",
-            Style::default().fg(Color::DarkGray),
-        )));
+        },
     }
 
     let title = match app.details.tab {
@@ -552,246 +470,206 @@ fn render_details_pane(frame: &mut Frame, app: &App, area: Rect) {
         DetailsTab::Dependencies => " Dependencies ",
         DetailsTab::ReverseDeps => " Reverse Deps ",
     };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(pane_border(app.ui.focused_pane == FocusedPane::Details));
+    let content: Vec<Line<'static>> = content.into_iter().map(owned_line).collect();
+    render_scrollable(frame, area, block, content, &mut app.details.scroll);
+}
 
-    let details = Paragraph::new(content)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(border_style),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((app.details.scroll, 0));
+/// Detach a line from the data it borrows
+fn owned_line(line: Line<'_>) -> Line<'static> {
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(|s| Span::styled(s.content.into_owned(), s.style))
+            .collect::<Vec<_>>(),
+    )
+    .style(line.style)
+}
 
-    frame.render_widget(details, area);
+/// Resolver errors and warnings as modal lines
+fn problem_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(problems) = app.core.plan_problems() else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    if !problems.errors.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Cannot apply - the resolver reported errors:",
+            Style::default().fg(Color::Red).bold(),
+        )));
+        for e in &problems.errors {
+            lines.push(Line::from(Span::styled(
+                format!("  {e}"),
+                Style::default().fg(Color::Red),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+    if !problems.warnings.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Warnings:",
+            Style::default().fg(Color::Yellow).bold(),
+        )));
+        for w in &problems.warnings {
+            lines.push(Line::from(format!("  {w}")));
+        }
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
+/// Section heading style for a group of changes
+fn change_group_style(action: ChangeAction, reason: ChangeReason) -> Style {
+    let color = match (action, reason) {
+        (ChangeAction::Upgrade, ChangeReason::UserRequested) => Color::Yellow,
+        (ChangeAction::Install | ChangeAction::Reinstall, ChangeReason::UserRequested) => {
+            Color::Green
+        }
+        (ChangeAction::Remove, ChangeReason::UserRequested) => Color::Red,
+        (ChangeAction::Remove, ChangeReason::Dependency) | (ChangeAction::Downgrade, _) => {
+            Color::Magenta
+        }
+        _ => Color::Cyan,
+    };
+    Style::default().fg(color).bold()
 }
 
 fn render_changes_modal(frame: &mut Frame, app: &mut App, area: Rect) {
-    let modal_width = 60.min(area.width.saturating_sub(4));
-    let modal_height = 20.min(area.height.saturating_sub(2));
-    let modal_x = area.x + (area.width - modal_width) / 2;
-    let modal_y = area.y + (area.height - modal_height) / 2;
-    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
-
+    let modal_area = centered_rect(
+        area,
+        70.min(area.width.saturating_sub(4)),
+        area.height.saturating_sub(2),
+    );
     frame.render_widget(Clear, modal_area);
 
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "The following changes will be made:",
-            Style::default().bold(),
-        )),
-        Line::from(""),
-    ];
+    let mut lines = problem_lines(app);
+    lines.push(Line::from(Span::styled(
+        "The following changes will be made:",
+        Style::default().bold(),
+    )));
+    lines.push(Line::from(""));
 
-    // Get planned changes - derive names from PackageId using cache
-    if let Some(changes) = app.core.planned_changes() {
-        let cache = app.core.cache();
-
-        // Helper to get display name from PackageId (strips native arch suffix)
-        let get_name = |c: &PlannedChange| -> String {
-            cache
-                .fullname_of(c.package)
-                .map(|name| cache.display_name(name).to_string())
-                .unwrap_or_else(|| format!("(unknown:{})", c.package.index()))
-        };
-
-        // Group by action and reason
-        let user_upgrades: Vec<_> = changes
-            .iter()
-            .filter(|c| {
-                c.action == ChangeAction::Upgrade && c.reason == ChangeReason::UserRequested
-            })
-            .collect();
-        let user_installs: Vec<_> = changes
-            .iter()
-            .filter(|c| {
-                c.action == ChangeAction::Install && c.reason == ChangeReason::UserRequested
-            })
-            .collect();
-        let dep_upgrades: Vec<_> = changes
-            .iter()
-            .filter(|c| c.action == ChangeAction::Upgrade && c.reason == ChangeReason::Dependency)
-            .collect();
-        let dep_installs: Vec<_> = changes
-            .iter()
-            .filter(|c| c.action == ChangeAction::Install && c.reason == ChangeReason::Dependency)
-            .collect();
-        let user_removes: Vec<_> = changes
-            .iter()
-            .filter(|c| c.action == ChangeAction::Remove && c.reason == ChangeReason::UserRequested)
-            .collect();
-        let auto_removes: Vec<_> = changes
-            .iter()
-            .filter(|c| c.action == ChangeAction::Remove && c.reason == ChangeReason::AutoRemove)
-            .collect();
-
-        if !user_upgrades.is_empty() {
+    let changes = app.core.planned_changes().unwrap_or_default();
+    let cache = app.core.cache();
+    for &action in ChangeAction::all() {
+        for reason in [ChangeReason::UserRequested, ChangeReason::Dependency] {
+            let group: Vec<&PlannedChange> = changes
+                .iter()
+                .filter(|c| c.action == action && c.reason == reason)
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            let suffix = match reason {
+                ChangeReason::UserRequested => "",
+                ChangeReason::Dependency => " (required by other changes)",
+            };
             lines.push(Line::from(Span::styled(
-                format!("UPGRADE ({}):", user_upgrades.len()),
-                Style::default().fg(Color::Yellow).bold(),
+                format!(
+                    "{}{suffix} ({}):",
+                    action.label().to_uppercase(),
+                    group.len()
+                ),
+                change_group_style(action, reason),
             )));
-            for c in &user_upgrades {
-                lines.push(Line::from(format!("  ↑ {}", get_name(c))));
+            for c in group {
+                lines.push(Line::from(format!(
+                    "  {} {}",
+                    action.status().symbol(),
+                    cache.display_name_of(c.package)
+                )));
             }
             lines.push(Line::from(""));
         }
-
-        if !user_installs.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("INSTALL ({}):", user_installs.len()),
-                Style::default().fg(Color::Green).bold(),
-            )));
-            for c in &user_installs {
-                lines.push(Line::from(format!("  + {}", get_name(c))));
-            }
-            lines.push(Line::from(""));
-        }
-
-        if !dep_upgrades.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("AUTO-UPGRADE (dependencies) ({}):", dep_upgrades.len()),
-                Style::default().fg(Color::Cyan).bold(),
-            )));
-            for c in &dep_upgrades {
-                lines.push(Line::from(format!("  ↑ {}", get_name(c))));
-            }
-            lines.push(Line::from(""));
-        }
-
-        if !dep_installs.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("AUTO-INSTALL (dependencies) ({}):", dep_installs.len()),
-                Style::default().fg(Color::Cyan).bold(),
-            )));
-            for c in &dep_installs {
-                lines.push(Line::from(format!("  + {}", get_name(c))));
-            }
-            lines.push(Line::from(""));
-        }
-
-        if !user_removes.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("REMOVE ({}):", user_removes.len()),
-                Style::default().fg(Color::Red).bold(),
-            )));
-            for c in &user_removes {
-                lines.push(Line::from(format!("  - {}", get_name(c))));
-            }
-            lines.push(Line::from(""));
-        }
-
-        if !auto_removes.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("AUTO-REMOVE (no longer needed) ({}):", auto_removes.len()),
-                Style::default().fg(Color::Magenta).bold(),
-            )));
-            for c in &auto_removes {
-                lines.push(Line::from(format!("  X {}", get_name(c))));
-            }
-            lines.push(Line::from(""));
-        }
-
-        // Download and size info (use precomputed values from plan)
-        let download_size = app.core.download_size();
-        let size_change = app.core.install_size_change();
-
+    }
+    if changes.is_empty() {
+        lines.push(Line::from(
+            "Nothing to do: every mark is already satisfied.",
+        ));
         lines.push(Line::from(""));
-        lines.push(Line::from(format!(
-            "Download size: {}",
-            PackageInfo::size_str(download_size)
-        )));
-
-        let size_change_str = if size_change >= 0 {
-            format!("+{}", PackageInfo::size_str(size_change as u64))
-        } else {
-            format!("-{}", PackageInfo::size_str((-size_change) as u64))
-        };
-        lines.push(Line::from(format!("Disk space change: {size_change_str}")));
-    } else {
-        lines.push(Line::from("No changes computed"));
     }
 
-    let modal = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title(" Confirm Changes ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((app.modals.changes_scroll, 0));
+    lines.push(Line::from(format!(
+        "Download size: {}",
+        size_str(app.core.download_size())
+    )));
+    lines.push(Line::from(format!(
+        "Disk space change: {}",
+        size_change_str(app.core.install_size_change())
+    )));
 
-    frame.render_widget(modal, modal_area);
+    let block = Block::default()
+        .title(" Confirm Changes ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    render_scrollable(frame, modal_area, block, lines, &mut app.modals.changes);
 }
 
 fn render_changelog_view(frame: &mut Frame, app: &mut App, area: Rect) {
-    let pkg_name = app
-        .selected_package()
-        .map(|p| p.name.clone())
-        .unwrap_or_else(|| "Unknown".to_string());
-
     let lines: Vec<Line> = app
         .modals
         .changelog_content
         .iter()
-        .map(|s| Line::from(s.as_str()))
+        .map(|s| Line::from(s.clone()))
         .collect();
-
-    let changelog = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title(format!(" Changelog: {pkg_name} "))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((app.modals.changelog_scroll, 0));
-
-    frame.render_widget(changelog, area);
+    let block = Block::default()
+        .title(format!(" Changelog: {} ", app.modals.changelog_title))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    render_scrollable(frame, area, block, lines, &mut app.modals.changelog);
 }
 
-fn render_settings_view(frame: &mut Frame, app: &mut App, area: Rect) {
+fn render_output_view(frame: &mut Frame, app: &mut App, area: Rect) {
+    let lines: Vec<Line> = app
+        .output_lines
+        .iter()
+        .map(|s| Line::from(s.clone()))
+        .collect();
+    let block = Block::default()
+        .title(" APT Output ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green));
+    render_scrollable(frame, area, block, lines, &mut app.modals.output);
+}
+
+fn render_settings_view(frame: &mut Frame, app: &App, area: Rect) {
     let all_cols = Column::all();
     let col_count = all_cols.len();
+    let selected_style = |idx: usize| {
+        if idx == app.settings_selection {
+            Style::default().bg(Color::DarkGray)
+        } else {
+            Style::default()
+        }
+    };
 
     let mut items: Vec<ListItem> = all_cols
         .iter()
         .enumerate()
         .map(|(idx, col)| {
-            let enabled = app.settings.visible_columns.contains(col);
-            let checkbox = if enabled { "[X]" } else { "[ ]" };
-            let text = format!("{checkbox} {}", col.label());
-            let style = if idx == app.settings_selection {
-                Style::default().bg(Color::DarkGray)
+            let checkbox = if app.settings.visible_columns.contains(col) {
+                "[X]"
             } else {
-                Style::default()
+                "[ ]"
             };
-            ListItem::new(text).style(style)
+            ListItem::new(format!("{checkbox} {}", col.label())).style(selected_style(idx))
         })
         .collect();
 
-    // Add sort options
     items.push(ListItem::new(""));
-    let sort_style = if app.settings_selection == col_count {
-        Style::default().bg(Color::DarkGray)
-    } else {
-        Style::default()
-    };
     items.push(
-        ListItem::new(format!("Sort by: {}", app.settings.sort_by.label())).style(sort_style),
+        ListItem::new(format!("Sort by: {}", app.settings.sort.sort_by.label()))
+            .style(selected_style(col_count)),
     );
-
-    let order_style = if app.settings_selection == col_count + 1 {
-        Style::default().bg(Color::DarkGray)
-    } else {
-        Style::default()
-    };
-    let order = if app.settings.sort_ascending {
+    let order = if app.settings.sort.ascending {
         "Ascending"
     } else {
         "Descending"
     };
-    items.push(ListItem::new(format!("Sort order: {order}")).style(order_style));
+    items.push(ListItem::new(format!("Sort order: {order}")).style(selected_style(col_count + 1)));
 
     let settings_list = List::new(items).block(
         Block::default()
@@ -799,164 +677,103 @@ fn render_settings_view(frame: &mut Frame, app: &mut App, area: Rect) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow)),
     );
-
     frame.render_widget(settings_list, area);
 }
 
-fn render_mark_preview_modal(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(ref preview) = app.mark_preview else {
+fn render_mark_preview_modal(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(preview) = &app.mark_preview else {
         return;
     };
 
-    let modal_width = 60.min(area.width.saturating_sub(4));
-    let modal_height = 20.min(area.height.saturating_sub(4));
-    let modal_x = area.x + (area.width - modal_width) / 2;
-    let modal_y = area.y + (area.height - modal_height) / 2;
-    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
-
+    let modal_area = centered_rect(
+        area,
+        60.min(area.width.saturating_sub(4)),
+        20.min(area.height.saturating_sub(4)),
+    );
     frame.render_widget(Clear, modal_area);
 
-    let mut lines = Vec::new();
+    let mut lines = vec![
+        Line::from(Span::styled(
+            preview.headline.clone(),
+            Style::default().bold(),
+        )),
+        Line::from(""),
+    ];
 
-    let title = match preview {
-        MarkPreview::Mark {
-            package_name,
-            is_upgrade,
-            additional_installs,
-            additional_upgrades,
-            additional_removes,
-            download_size,
-            bulk_acted_ids,
-        } => {
-            let header = if bulk_acted_ids.len() > 1 {
-                format!("Mark {package_name} for install/upgrade?")
-            } else {
-                let action = if *is_upgrade { "upgrade" } else { "install" };
-                format!("Mark '{package_name}' for {action}?")
-            };
-            lines.push(Line::from(Span::styled(header, Style::default().bold())));
-            lines.push(Line::from(""));
-
-            if !additional_installs.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "Will install {} additional packages:",
-                        additional_installs.len()
-                    ),
-                    Style::default().fg(Color::Green),
-                )));
-                for name in additional_installs {
-                    lines.push(Line::from(format!("  + {name}")));
-                }
-                lines.push(Line::from(""));
-            }
-
-            if !additional_upgrades.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("Will upgrade {} packages:", additional_upgrades.len()),
-                    Style::default().fg(Color::Yellow),
-                )));
-                for name in additional_upgrades {
-                    lines.push(Line::from(format!("  ^ {name}")));
-                }
-                lines.push(Line::from(""));
-            }
-
-            if !additional_removes.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("Will remove {} packages:", additional_removes.len()),
-                    Style::default().fg(Color::Red),
-                )));
-                for name in additional_removes {
-                    lines.push(Line::from(format!("  - {name}")));
-                }
-                lines.push(Line::from(""));
-            }
-
-            lines.push(Line::from(Span::styled(
-                format!("Download size: {}", PackageInfo::size_str(*download_size)),
-                Style::default().fg(Color::Cyan),
-            )));
-
-            " Confirm Package Mark "
+    for &action in ChangeAction::all() {
+        let names: Vec<&String> = preview
+            .added
+            .iter()
+            .filter(|(_, a)| *a == action)
+            .map(|(n, _)| n)
+            .collect();
+        if names.is_empty() {
+            continue;
         }
-        MarkPreview::Unmark {
-            package_name,
-            also_unmarked,
-            bulk_acted_ids,
-            ..
-        } => {
-            let header = if bulk_acted_ids.len() > 1 {
-                format!("Unmark {package_name}?")
-            } else {
-                format!("Unmark '{package_name}'?")
-            };
-            lines.push(Line::from(Span::styled(header, Style::default().bold())));
-            lines.push(Line::from(""));
-
-            if !also_unmarked.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("This will also unmark {} packages:", also_unmarked.len()),
-                    Style::default().fg(Color::Yellow),
-                )));
-                for name in also_unmarked {
-                    lines.push(Line::from(format!("  {name}")));
-                }
-            }
-
-            " Confirm Package Unmark "
+        lines.push(Line::from(Span::styled(
+            format!(
+                "This also marks {} for {}:",
+                names.len(),
+                action.label().to_lowercase()
+            ),
+            Style::default().fg(action.status().color()),
+        )));
+        for name in names {
+            lines.push(Line::from(format!("  {} {name}", action.status().symbol())));
         }
-    };
+        lines.push(Line::from(""));
+    }
 
-    // Apply scroll offset
-    let visible_lines: Vec<Line> = lines.into_iter().skip(app.mark_preview_scroll).collect();
+    if !preview.dropped.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("This also unmarks {} packages:", preview.dropped.len()),
+            Style::default().fg(Color::Yellow),
+        )));
+        for name in &preview.dropped {
+            lines.push(Line::from(format!("  {name}")));
+        }
+        lines.push(Line::from(""));
+    }
 
-    let modal = Paragraph::new(visible_lines)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta)),
+    if preview.download_size > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("Download size: {}", size_str(preview.download_size)),
+            Style::default().fg(Color::Cyan),
+        )));
+    }
+    lines.extend(problem_lines(app));
+
+    let block = Block::default()
+        .title(" Confirm ")
+        .title_bottom(
+            Line::from(format!(" {} ", keymap::help_line(&[Context::MarkConfirm]))).centered(),
         )
-        .wrap(Wrap { trim: false });
-
-    frame.render_widget(modal, modal_area);
-
-    // Hint at bottom
-    let hint_area = Rect::new(
-        modal_area.x,
-        modal_area.y + modal_area.height - 1,
-        modal_area.width,
-        1,
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+    render_scrollable(
+        frame,
+        modal_area,
+        block,
+        lines,
+        &mut app.modals.mark_preview,
     );
-    let hint = Paragraph::new(Span::styled(
-        " Space: Confirm │ Esc: Cancel │ ↑↓: Scroll ",
-        Style::default().fg(Color::DarkGray),
-    ))
-    .alignment(Alignment::Center);
-    frame.render_widget(hint, hint_area);
 }
 
-fn render_exit_confirm_modal(frame: &mut Frame, _app: &App, area: Rect) {
-    let modal_width = 50.min(area.width.saturating_sub(4));
-    let modal_height = 7;
-    let modal_x = area.x + (area.width - modal_width) / 2;
-    let modal_y = area.y + (area.height - modal_height) / 2;
-    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
-
+fn render_exit_confirm_modal(frame: &mut Frame, area: Rect) {
+    let modal_area = centered_rect(area, 50.min(area.width.saturating_sub(4)), 7);
     frame.render_widget(Clear, modal_area);
 
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "You have unsaved changes!",
+            "You have unapplied changes!",
             Style::default().fg(Color::Red).bold(),
         )),
         Line::from(""),
         Line::from("Really quit without applying?"),
         Line::from(""),
         Line::from(Span::styled(
-            "Space: Quit │ Esc: Cancel",
+            keymap::help_line(&[Context::ConfirmExit]),
             Style::default().fg(Color::DarkGray),
         )),
     ];

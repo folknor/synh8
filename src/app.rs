@@ -3,12 +3,17 @@
 //! This module contains TUI-specific state and acts as an adapter between
 //! the core business logic (ManagerState) and the ratatui UI.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::rc::Rc;
 
-use color_eyre::Result;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::widgets::{ListState, TableState};
+use rust_apt::DepType;
 
-use synh8::core::{ManagerState, check_apt_lock};
+use synh8::apt::fetch_changelog;
+use synh8::core::{ManagerState, Toggle};
+use synh8::keymap::{self, Action, Context};
 use synh8::progress::{ProgressState, StdioRedirect, TuiAcquireProgress, TuiInstallProgress};
 use synh8::types::*;
 
@@ -27,31 +32,32 @@ pub struct UiState {
 
 /// Details pane state and cached data
 pub struct DetailsState {
-    pub scroll: u16,
+    pub scroll: ScrollView,
     pub tab: DetailsTab,
-    pub cached_deps: Vec<(String, String)>,
-    pub cached_rdeps: Vec<(String, String)>,
+    pub cached_deps: Vec<(DepType, String)>,
+    pub cached_rdeps: Vec<(DepType, String)>,
     pub cached_pkg_name: String,
 }
 
-impl Default for DetailsState {
-    fn default() -> Self {
-        Self {
-            scroll: 0,
-            tab: DetailsTab::Info,
-            cached_deps: Vec::new(),
-            cached_rdeps: Vec::new(),
-            cached_pkg_name: String::new(),
-        }
-    }
-}
-
-/// Modal/popup scroll positions and content
+/// Scroll positions and content of modal views
 #[derive(Default)]
 pub struct ModalState {
-    pub changes_scroll: u16,
-    pub changelog_scroll: u16,
+    pub changes: ScrollView,
+    pub changelog: ScrollView,
+    pub changelog_title: String,
     pub changelog_content: Vec<String>,
+    pub mark_preview: ScrollView,
+    pub output: ScrollView,
+}
+
+/// What the event loop must do after a key was handled
+pub enum Outcome {
+    Continue,
+    Quit,
+    /// Apply the plan (needs the terminal cleared around it)
+    Commit,
+    /// Run `apt update` (needs the terminal cleared afterwards)
+    Update,
 }
 
 /// TUI Application - wraps ManagerState with UI state
@@ -70,10 +76,12 @@ pub struct App {
     pub status_message: String,
     pub output_lines: Vec<String>,
 
-    /// Mark preview state (shown before confirming package mark)
+    /// Mark preview shown in the ShowingMarkConfirm modal
     pub mark_preview: Option<MarkPreview>,
-    pub mark_preview_scroll: usize,
-    pub output_scroll: u16,
+
+    /// Search query that was active when search input started, restored
+    /// if the input is cancelled
+    search_before: Option<String>,
 
     /// Incremental startup warm-up: index into FilterCategory::all() for next
     /// filter to pre-warm, then search index. None = warm-up complete.
@@ -81,12 +89,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new() -> Result<Self> {
+    pub fn new() -> color_eyre::Result<Self> {
         let core = ManagerState::new()?;
         let mut filter_state = ListState::default();
         filter_state.select(Some(0));
 
-        let settings = Settings::default();
         let mut app = Self {
             core,
             ui: UiState {
@@ -98,23 +105,26 @@ impl App {
                 visual_mode: false,
                 table_visible_rows: 0,
             },
-            details: DetailsState::default(),
+            details: DetailsState {
+                scroll: ScrollView::default(),
+                tab: DetailsTab::Info,
+                cached_deps: Vec::new(),
+                cached_rdeps: Vec::new(),
+                cached_pkg_name: String::new(),
+            },
             modals: ModalState::default(),
             state: AppState::Listing,
-            settings,
+            settings: Settings::default(),
             settings_selection: 0,
-            col_widths: ColumnWidths::new(),
-            status_message: String::from("Loading..."),
+            col_widths: ColumnWidths::default(),
+            status_message: String::new(),
             output_lines: Vec::new(),
             mark_preview: None,
-            mark_preview_scroll: 0,
-            output_scroll: 0,
+            search_before: None,
             warm_step: Some(0),
         };
 
-        // Sync sort settings from UI settings to core
-        app.core
-            .set_sort(app.settings.sort_by, app.settings.sort_ascending);
+        app.core.set_sort(app.settings.sort);
         app.refresh_ui_state();
         app.update_status_message();
         // Filter cache and search index are warmed incrementally via
@@ -123,39 +133,32 @@ impl App {
     }
 
     /// Do one unit of startup warm-up work. Called during idle event loop
-    /// cycles so the UI stays responsive. Returns true if there's more
-    /// work to do.
-    pub fn warm_next(&mut self) -> bool {
-        let step = match self.warm_step {
-            Some(s) => s,
-            None => return false,
+    /// cycles so the UI stays responsive.
+    pub fn warm_next(&mut self) {
+        let Some(step) = self.warm_step else {
+            return;
         };
 
         let filters = FilterCategory::all();
-        let current_filter = self.core.selected_filter();
-
-        if step < filters.len() {
-            // Pre-warm one filter cache entry per call
-            let filter = filters[step];
-            if filter != current_filter {
+        if let Some(&filter) = filters.get(step) {
+            // Only the cached filters are worth warming, and the cache is
+            // bypassed while a search is active.
+            let current = self.core.selected_filter();
+            if filter != current
+                && filter != FilterCategory::MarkedChanges
+                && !self.core.has_search_results()
+            {
                 self.core.set_filter(filter);
                 self.core.rebuild_list();
-            }
-            // Restore original filter after warming a different one
-            if filter != current_filter {
-                self.core.set_filter(current_filter);
-                self.core.rebuild_list();
+                self.core.set_filter(current);
+                self.col_widths = self.core.rebuild_list();
             }
             self.warm_step = Some(step + 1);
-            true
-        } else if step == filters.len() {
-            // Build search index
-            drop(self.core.ensure_search_index());
-            self.warm_step = None;
-            false
         } else {
             self.warm_step = None;
-            false
+            if let Err(e) = self.core.ensure_search_index() {
+                self.status_message = format!("Failed to build search index: {e}");
+            }
         }
     }
 
@@ -181,17 +184,8 @@ impl App {
 
         self.ui
             .table_state
-            .select(if self.core.package_count() > 0 {
-                Some(new_idx)
-            } else {
-                None
-            });
+            .select((self.core.package_count() > 0).then_some(new_idx));
         self.center_scroll_offset();
-    }
-
-    /// Reset UI selection state to beginning
-    fn reset_selection(&mut self) {
-        self.restore_selection(None);
     }
 
     // === Accessors ===
@@ -203,20 +197,10 @@ impl App {
             .and_then(|i| self.core.get_package(i))
     }
 
-    #[must_use]
-    pub fn has_pending_changes(&self) -> bool {
-        self.core.has_marks()
+    fn selected_display_name(&self) -> Option<String> {
+        self.selected_package()
+            .map(|p| self.core.cache().display_name(&p.name).to_string())
     }
-
-    #[must_use]
-    pub fn total_changes_count(&self) -> usize {
-        match self.core.planned_changes() {
-            Some(changes) => changes.len(),
-            None => 0,
-        }
-    }
-
-    // === Dependency caching (TUI optimization) ===
 
     #[hotpath::measure]
     pub fn update_cached_deps(&mut self) {
@@ -228,48 +212,254 @@ impl App {
         if pkg_name == self.details.cached_pkg_name {
             return;
         }
-        self.details.cached_pkg_name = pkg_name.clone();
         self.details.cached_deps = self.core.get_dependencies(&pkg_name);
         self.details.cached_rdeps = self.core.get_reverse_dependencies(&pkg_name);
+        self.details.cached_pkg_name = pkg_name;
+    }
+
+    // === Key handling ===
+
+    /// Contexts whose bindings are active, highest priority first
+    pub fn key_contexts(&self) -> Vec<Context> {
+        let mut stack = vec![Context::Anywhere];
+        stack.extend(self.help_contexts());
+        if self.state == AppState::Listing {
+            stack.push(Context::Global);
+        }
+        stack
+    }
+
+    /// Contexts shown in the help bar
+    pub fn help_contexts(&self) -> Vec<Context> {
+        match self.state {
+            AppState::Listing => {
+                let mut stack = Vec::new();
+                if self.ui.visual_mode {
+                    stack.push(Context::Visual);
+                } else if self.core.has_search_results() {
+                    stack.push(Context::SearchActive);
+                }
+                stack.push(match self.ui.focused_pane {
+                    FocusedPane::Filters => Context::Filters,
+                    FocusedPane::Packages => Context::Packages,
+                    FocusedPane::Details => Context::Details,
+                });
+                stack
+            }
+            AppState::Searching => vec![Context::Search],
+            AppState::ShowingMarkConfirm => vec![Context::MarkConfirm],
+            AppState::ShowingChanges => vec![Context::Changes],
+            AppState::ShowingChangelog => vec![Context::Changelog],
+            AppState::ShowingSettings => vec![Context::Settings],
+            AppState::ConfirmExit => vec![Context::ConfirmExit],
+            AppState::Done => vec![Context::Done],
+        }
+    }
+
+    pub fn handle_key(&mut self, key: &KeyEvent) -> Outcome {
+        let Some(action) = keymap::lookup(&self.key_contexts(), key) else {
+            return Outcome::Continue;
+        };
+        if action == Action::ForceQuit {
+            return Outcome::Quit;
+        }
+        match self.state {
+            AppState::Listing => return self.listing_action(action),
+            AppState::Searching => self.search_action(action, key),
+            AppState::ShowingMarkConfirm => match action {
+                Action::Confirm => self.confirm_mark(),
+                Action::Cancel => self.cancel_mark(),
+                nav => scroll(&mut self.modals.mark_preview, nav),
+            },
+            AppState::ShowingChanges => match action {
+                Action::Confirm => {
+                    if self.core.can_apply() {
+                        return Outcome::Commit;
+                    }
+                    self.status_message = self.plan_status();
+                }
+                Action::Cancel => {
+                    self.state = AppState::Listing;
+                    self.refresh_ui_state();
+                }
+                nav => scroll(&mut self.modals.changes, nav),
+            },
+            AppState::ShowingChangelog => match action {
+                Action::Cancel => self.state = AppState::Listing,
+                nav => scroll(&mut self.modals.changelog, nav),
+            },
+            AppState::ShowingSettings => match action {
+                Action::Up => self.settings_selection = self.settings_selection.saturating_sub(1),
+                Action::Down => {
+                    self.settings_selection =
+                        (self.settings_selection + 1).min(Self::settings_item_count() - 1);
+                }
+                Action::Confirm => self.toggle_setting(),
+                Action::Cancel => {
+                    self.state = AppState::Listing;
+                    self.refresh_ui_state();
+                }
+                _ => {}
+            },
+            AppState::ConfirmExit => match action {
+                Action::Confirm => return Outcome::Quit,
+                Action::Cancel => self.state = AppState::Listing,
+                _ => {}
+            },
+            AppState::Done => match action {
+                Action::Cancel => {
+                    self.state = AppState::Listing;
+                    self.refresh_ui_state();
+                    self.update_status_message();
+                }
+                nav => scroll(&mut self.modals.output, nav),
+            },
+        }
+        Outcome::Continue
+    }
+
+    fn listing_action(&mut self, action: Action) -> Outcome {
+        match action {
+            Action::Quit => {
+                if self.core.has_intents() {
+                    self.state = AppState::ConfirmExit;
+                } else {
+                    return Outcome::Quit;
+                }
+            }
+            Action::Update => return Outcome::Update,
+            Action::FocusNext => self.cycle_focus(1),
+            Action::FocusPrev => self.cycle_focus(2),
+            Action::StartSearch => self.start_search(),
+            Action::OpenSettings => {
+                self.settings_selection = 0;
+                self.state = AppState::ShowingSettings;
+            }
+            Action::ClearSearch => {
+                self.core.clear_search();
+                self.refresh_ui_state();
+                self.update_status_message();
+            }
+            Action::Up
+            | Action::Down
+            | Action::PageUp
+            | Action::PageDown
+            | Action::Home
+            | Action::End => {
+                self.navigate(action);
+            }
+            Action::Toggle => self.toggle_current(),
+            Action::MarkInstall => self.set_intent_current(UserIntent::Install),
+            Action::MarkRemove => self.set_intent_current(UserIntent::Remove),
+            Action::MarkHold => self.set_intent_current(UserIntent::Hold),
+            Action::VisualStart => self.start_visual_mode(),
+            Action::VisualMark => self.mark_selection(),
+            Action::VisualRemove => self.remove_selection(),
+            Action::Cancel => self.cancel_visual_mode(),
+            Action::Changelog => self.show_changelog(),
+            Action::ReviewChanges => self.show_changes_preview(),
+            Action::MarkAllUpgrades => self.mark_all_upgrades(),
+            Action::UnmarkAll => {
+                self.core.reset();
+                self.refresh_ui_state();
+                self.update_status_message();
+            }
+            Action::PrevTab => self.switch_details_tab(2),
+            Action::NextTab => self.switch_details_tab(1),
+            _ => {}
+        }
+        Outcome::Continue
+    }
+
+    fn navigate(&mut self, action: Action) {
+        match self.ui.focused_pane {
+            FocusedPane::Filters => {
+                let last = FilterCategory::all().len() - 1;
+                let current = self.ui.filter_state.selected().unwrap_or(0);
+                let target = match action {
+                    Action::Up | Action::PageUp => current.saturating_sub(1),
+                    Action::Down | Action::PageDown => (current + 1).min(last),
+                    Action::Home => 0,
+                    _ => last,
+                };
+                self.select_filter(target);
+            }
+            FocusedPane::Packages => {
+                let page = self.ui.table_visible_rows.max(1) as isize;
+                let count = self.core.package_count() as isize;
+                let delta = match action {
+                    Action::Up => -1,
+                    Action::Down => 1,
+                    Action::PageUp => -page,
+                    Action::PageDown => page,
+                    Action::Home => -count,
+                    _ => count,
+                };
+                self.move_package_selection(delta);
+            }
+            FocusedPane::Details => scroll(&mut self.details.scroll, action),
+        }
     }
 
     // === Search ===
 
-    pub fn start_search(&mut self) {
+    fn start_search(&mut self) {
         match self.core.ensure_search_index() {
-            Ok(duration) => {
-                if duration.as_millis() > 0 {
-                    self.status_message = format!(
-                        "Search index built in {:.0}ms",
-                        duration.as_secs_f64() * 1000.0
-                    );
-                }
+            Ok(duration) if !duration.is_zero() => {
+                self.status_message = format!(
+                    "Search index built in {:.0}ms",
+                    duration.as_secs_f64() * 1000.0
+                );
             }
+            Ok(_) => {}
             Err(e) => {
                 self.status_message = format!("Failed to build search index: {e}");
                 return;
             }
         }
+        self.search_before = Some(self.core.search_query().to_string());
         self.state = AppState::Searching;
     }
 
-    pub fn execute_search(&mut self) {
-        let query = self.core.search_query().to_string();
-        if let Err(e) = self.core.set_search_query(&query) {
+    fn search_action(&mut self, action: Action, key: &KeyEvent) {
+        match action {
+            Action::SearchInput => {
+                if let KeyCode::Char(c) = key.code {
+                    let mut query = self.core.search_query().to_string();
+                    query.push(c);
+                    self.run_search(&query);
+                }
+            }
+            Action::SearchBackspace => {
+                let mut query = self.core.search_query().to_string();
+                query.pop();
+                self.run_search(&query);
+            }
+            Action::SearchConfirm => self.confirm_search(),
+            Action::Cancel => {
+                let before = self.search_before.take().unwrap_or_default();
+                self.run_search(&before);
+                self.state = AppState::Listing;
+                self.update_status_message();
+            }
+            nav => {
+                self.confirm_search();
+                self.ui.focused_pane = FocusedPane::Packages;
+                self.navigate(nav);
+            }
+        }
+    }
+
+    fn run_search(&mut self, query: &str) {
+        if let Err(e) = self.core.set_search_query(query) {
             self.status_message = format!("Search error: {e}");
         }
         self.refresh_ui_state();
     }
 
-    pub fn cancel_search(&mut self) {
-        self.core.clear_search();
+    fn confirm_search(&mut self) {
         self.state = AppState::Listing;
-        self.refresh_ui_state();
-        self.update_status_message();
-    }
-
-    pub fn confirm_search(&mut self) {
-        self.state = AppState::Listing;
+        self.search_before = None;
         if let Some(count) = self.core.search_result_count() {
             self.status_message = format!(
                 "Found {} packages matching '{}'",
@@ -281,517 +471,296 @@ impl App {
 
     // === Filter ===
 
-    pub fn apply_current_filter(&mut self) {
-        self.col_widths = self.core.rebuild_list();
-        self.reset_selection();
-    }
-
-    pub fn select_first_filter(&mut self) {
-        self.move_filter_selection(-(FilterCategory::all().len() as i32));
-    }
-
-    pub fn select_last_filter(&mut self) {
-        self.move_filter_selection(FilterCategory::all().len() as i32);
-    }
-
-    pub fn move_filter_selection(&mut self, delta: i32) {
-        // Cancel visual mode since the package list is about to change
+    fn select_filter(&mut self, index: usize) {
         if self.ui.visual_mode {
             self.cancel_visual_mode();
         }
-
-        let filters = FilterCategory::all();
-        let current = self.ui.filter_state.selected().unwrap_or(0) as i32;
-        let new_idx = (current + delta).clamp(0, filters.len() as i32 - 1) as usize;
-        self.ui.filter_state.select(Some(new_idx));
-
-        // Set filter and rebuild once. refresh_ui_state() handles rebuild,
-        // selection restore, and dep cache update.
-        self.core.set_filter(filters[new_idx]);
+        self.ui.filter_state.select(Some(index));
+        self.core.set_filter(FilterCategory::all()[index]);
         self.refresh_ui_state();
     }
 
-    // === Package marking ===
+    // === Marking ===
 
-    pub fn toggle_current(&mut self) {
+    /// Run a mark action and show what it did beyond the packages it targeted.
+    ///
+    /// `edit` applies the change to the core and returns the headline for the
+    /// confirmation modal, or an error for the status bar (in which case it
+    /// must not have changed anything). The modal is only shown when the plan
+    /// changed beyond `acted` in a way worth confirming: new installs,
+    /// removals or downgrades, or packages dropping out of the plan.
+    fn run_mark_action(
+        &mut self,
+        acted: &[PackageId],
+        edit: impl FnOnce(&mut ManagerState) -> Result<String, String>,
+    ) {
+        let undo = self.core.intents();
+        let before = self.core.planned_ids();
+        let headline = match edit(&mut self.core) {
+            Ok(headline) => headline,
+            Err(message) => {
+                self.status_message = message;
+                return;
+            }
+        };
+        let acted: HashSet<PackageId> = acted.iter().copied().collect();
+        let diff = self.core.diff_since(&before, &acted);
+        let needs_confirm = !diff.dropped.is_empty()
+            || diff.added.iter().any(|c| c.action != ChangeAction::Upgrade);
+
+        self.refresh_ui_state();
+        self.update_status_message();
+        if !needs_confirm {
+            return;
+        }
+        let cache = self.core.cache();
+        self.mark_preview = Some(MarkPreview {
+            headline,
+            added: diff
+                .added
+                .iter()
+                .map(|c| (cache.display_name_of(c.package), c.action))
+                .collect(),
+            dropped: diff
+                .dropped
+                .iter()
+                .map(|&id| cache.display_name_of(id))
+                .collect(),
+            download_size: diff.download_size,
+            undo,
+        });
+        self.modals.mark_preview = ScrollView::default();
+        self.state = AppState::ShowingMarkConfirm;
+    }
+
+    /// Space: mark for install/upgrade, or undo whatever marked the package
+    fn toggle_current(&mut self) {
+        let Some(pkg) = self.selected_package() else {
+            return;
+        };
+        let (id, status) = (pkg.id, pkg.status);
+        let name = self.selected_display_name().unwrap_or_default();
+
+        if status == PackageStatus::Installed {
+            self.status_message = format!(
+                "{name} is installed and up to date ('{}' removes it)",
+                keymap::key_label(Context::Packages, Action::MarkRemove)
+            );
+            return;
+        }
+        self.run_mark_action(&[id], |core| match core.toggle(id) {
+            Toggle::Marked => {
+                let verb = if status == PackageStatus::Upgradable {
+                    "upgrade"
+                } else {
+                    "install"
+                };
+                Ok(format!("Marked '{name}' for {verb}"))
+            }
+            Toggle::Unmarked => Ok(format!("Unmarked '{name}'")),
+            Toggle::NotUnmarkable => Err(format!(
+                "{name} is required by other changes - unmark the package that needs it"
+            )),
+        });
+    }
+
+    /// +, -, =: set an explicit intent, or clear it if it is already set
+    fn set_intent_current(&mut self, intent: UserIntent) {
         let Some(pkg) = self.selected_package() else {
             return;
         };
         let id = pkg.id;
-        // Use display name (strips native arch suffix)
-        let pkg_name = self.core.cache().display_name(&pkg.name).to_string();
-        let was_marked = pkg.status.is_marked();
+        let installed = !pkg.installed_version.is_empty();
+        let up_to_date = installed && pkg.installed_version == pkg.candidate_version;
+        let name = self.selected_display_name().unwrap_or_default();
+        let current = self.core.intent_of(id);
 
-        // Skip toggle for installed non-upgradable packages that aren't already marked
-        if !was_marked && pkg.status == PackageStatus::Installed {
-            self.status_message = format!("{pkg_name} is already installed and up to date");
+        if current != Some(intent) {
+            match intent {
+                UserIntent::Remove if !installed => {
+                    self.status_message = format!("{name} is not installed");
+                    return;
+                }
+                UserIntent::Install if up_to_date => {
+                    self.status_message = format!("{name} is installed and up to date");
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        self.run_mark_action(&[id], |core| {
+            if current == Some(intent) {
+                core.edit_intents([(id, None)]);
+                return Ok(format!("Unmarked '{name}'"));
+            }
+            core.edit_intents([(id, Some(intent))]);
+            Ok(match intent {
+                UserIntent::Install => format!("Marked '{name}' for install/upgrade"),
+                UserIntent::Remove => format!("Marked '{name}' for removal"),
+                UserIntent::Hold => format!("Holding '{name}' at its current state"),
+            })
+        });
+    }
+
+    fn confirm_mark(&mut self) {
+        self.mark_preview = None;
+        self.state = AppState::Listing;
+        self.update_status_message();
+    }
+
+    fn cancel_mark(&mut self) {
+        if let Some(preview) = self.mark_preview.take() {
+            self.core.restore_intents(preview.undo);
+        }
+        self.state = AppState::Listing;
+        self.refresh_ui_state();
+        self.update_status_message();
+    }
+
+    fn mark_all_upgrades(&mut self) {
+        if self.core.mark_all_upgradable() == 0 {
+            self.status_message = "No unmarked upgradable packages".to_string();
             return;
         }
-
-        // Track if this was a user-marked package (vs dependency) BEFORE toggle
-        let was_user_marked = self.core.is_user_marked(id);
-
-        // Snapshot currently planned packages BEFORE the toggle so we can
-        // show only the NEW dependencies in the confirmation modal
-        let previously_planned: HashSet<PackageId> = self
-            .core
-            .planned_changes()
-            .map(|changes| changes.iter().map(|c| c.package).collect())
-            .unwrap_or_default();
-
-        // Use the library's toggle() which handles cascade correctly
-        let result = self.core.toggle(id);
-
-        match result {
-            ToggleResult::Marked {
-                package: _,
-                additional,
-            } => {
-                if additional.is_empty() {
-                    // No additional deps, just update UI
-                    self.refresh_ui_state();
-                    self.update_status_message();
-                } else {
-                    let preview = self.core.build_mark_preview(id, &previously_planned);
-                    // Only show confirmation if the plan includes non-upgrade actions
-                    // (installs, removes). Pure upgrade deps are expected and don't
-                    // need confirmation.
-                    let needs_confirm = match &preview {
-                        Some(MarkPreview::Mark {
-                            additional_installs,
-                            additional_removes,
-                            ..
-                        }) => !additional_installs.is_empty() || !additional_removes.is_empty(),
-                        _ => true,
-                    };
-                    if needs_confirm {
-                        self.mark_preview = preview;
-                        self.mark_preview_scroll = 0;
-                        self.state = AppState::ShowingMarkConfirm;
-                    } else {
-                        self.refresh_ui_state();
-                        self.update_status_message();
-                    }
-                }
-            }
-            ToggleResult::Unmarked {
-                package: _,
-                also_unmarked,
-            } => {
-                // Package was unmarked - check if cascade happened
-                if also_unmarked.is_empty() {
-                    // No cascade, just update UI
-                    self.refresh_ui_state();
-                    self.update_status_message();
-                } else {
-                    // Build preview showing what was unmarked (using display names)
-                    let cache = self.core.cache();
-                    let also_names: Vec<String> = also_unmarked
-                        .iter()
-                        .filter_map(|id| {
-                            cache
-                                .fullname_of(*id)
-                                .map(|n| cache.display_name(n).to_string())
-                        })
-                        .collect();
-
-                    let preview = MarkPreview::Unmark {
-                        package_name: pkg_name,
-                        was_user_marked,
-                        also_unmarked: also_names,
-                        bulk_acted_ids: Vec::new(),
-                    };
-                    self.mark_preview = Some(preview);
-                    self.mark_preview_scroll = 0;
-                    self.state = AppState::ShowingMarkConfirm;
-                }
-            }
-            ToggleResult::NoChange { package: _ } => {
-                // Couldn't unmark - it's a dependency we can't trace
-                // Tell user to unmark the original package instead
-                self.status_message =
-                    format!("{pkg_name} is a dependency - unmark the package that requires it");
-                self.refresh_ui_state();
-            }
-        }
-    }
-
-    pub fn confirm_mark(&mut self) {
-        // Package is already marked and planned - just close the modal
-        self.mark_preview = None;
         self.refresh_ui_state();
-        self.update_status_message();
-        self.state = AppState::Listing;
-    }
-
-    /// Resolve a display name (which may have the native arch suffix stripped)
-    /// back to a PackageId by looking up the full cache, not the filtered list.
-    fn resolve_display_name_to_id(&self, display_name: &str) -> Option<PackageId> {
-        let cache = self.core.cache();
-        // Try the display name as-is (works for foreign-arch packages)
-        if let Some(id) = cache.get_id(display_name) {
-            return Some(id);
-        }
-        // Try with the native arch suffix appended (the common case)
-        let fullname = format!("{}:{}", display_name, cache.native_arch());
-        cache.get_id(&fullname)
-    }
-
-    pub fn cancel_mark(&mut self) {
-        if let Some(ref preview) = self.mark_preview {
-            match preview {
-                MarkPreview::Mark {
-                    package_name,
-                    bulk_acted_ids,
-                    ..
-                } => {
-                    if !bulk_acted_ids.is_empty() {
-                        // Bulk cancel: reverse by ID directly
-                        for &id in bulk_acted_ids {
-                            self.core.unmark(id);
-                        }
-                        self.core.compute_plan();
-                    } else {
-                        // Single mark cancel: unmark the package
-                        let id_to_unmark = self.resolve_display_name_to_id(package_name);
-                        if let Some(id) = id_to_unmark {
-                            self.core.unmark(id);
-                        }
-                    }
-                }
-                MarkPreview::Unmark {
-                    package_name,
-                    was_user_marked,
-                    also_unmarked,
-                    bulk_acted_ids,
-                } => {
-                    if !bulk_acted_ids.is_empty() {
-                        // Bulk cancel: re-mark by ID directly
-                        for &id in bulk_acted_ids {
-                            self.core.mark_install(id);
-                        }
-                        self.core.compute_plan();
-                    } else {
-                        // Single unmark cancel: re-mark the USER-MARKED packages only
-                        // Dependencies will be restored automatically by compute_plan()
-                        let names_to_remark: Vec<String> = if *was_user_marked {
-                            vec![package_name.clone()]
-                        } else {
-                            also_unmarked.clone()
-                        };
-
-                        let ids_to_remark: Vec<_> = names_to_remark
-                            .iter()
-                            .filter_map(|name| self.resolve_display_name_to_id(name))
-                            .collect();
-
-                        for id in ids_to_remark {
-                            self.core.mark_install(id);
-                        }
-                        self.core.compute_plan();
-                    }
-                }
-            }
-        }
-        self.mark_preview = None;
-        self.refresh_ui_state();
-        self.update_status_message();
-        self.state = AppState::Listing;
-    }
-
-    pub fn mark_all_upgrades(&mut self) {
-        // Mark all upgradable packages in the full cache (not just filtered view)
-        self.core.mark_all_upgradable();
-        // show_changes_preview will compute_plan + rebuild, no need to refresh_ui_state here
-        self.update_status_message();
         self.show_changes_preview();
-    }
-
-    pub fn unmark_all(&mut self) {
-        self.core.reset();
-        self.refresh_ui_state();
-        self.update_status_message();
     }
 
     // === Visual mode ===
 
-    pub fn start_visual_mode(&mut self) {
+    fn start_visual_mode(&mut self) {
         let current_idx = self.ui.table_state.selected().unwrap_or(0);
-
-        if !self.ui.visual_mode {
-            self.ui.visual_mode = true;
-            self.ui.selection_anchor = Some(current_idx);
-            self.ui.visual_range = Some((current_idx, current_idx));
-            self.status_message =
-                "-- VISUAL -- (↑↓ to select, Space to mark, Esc to cancel)".to_string();
-        } else {
-            self.mark_selected_packages();
-        }
+        self.ui.visual_mode = true;
+        self.ui.selection_anchor = Some(current_idx);
+        self.ui.visual_range = Some((current_idx, current_idx));
+        self.status_message = "-- VISUAL --".to_string();
     }
 
-    pub fn update_visual_selection(&mut self) {
+    fn update_visual_selection(&mut self) {
         if !self.ui.visual_mode {
             return;
         }
-
         let current_idx = self.ui.table_state.selected().unwrap_or(0);
         if let Some(anchor) = self.ui.selection_anchor {
-            let start = anchor.min(current_idx);
-            let end = anchor.max(current_idx);
-            self.ui.visual_range = Some((start, end));
+            self.ui.visual_range = Some((anchor.min(current_idx), anchor.max(current_idx)));
         }
     }
 
-    pub fn cancel_visual_mode(&mut self) {
+    fn cancel_visual_mode(&mut self) {
         self.ui.visual_mode = false;
         self.ui.visual_range = None;
         self.ui.selection_anchor = None;
         self.update_status_message();
     }
 
-    pub fn toggle_multi_select(&mut self) {
-        if !self.ui.visual_mode {
-            self.start_visual_mode();
-        } else {
-            self.mark_selected_packages();
+    /// End visual mode, returning the anchor row and the selected rows
+    fn take_selection(&mut self) -> Option<(usize, Vec<PackageInfo>)> {
+        let anchor = self.ui.selection_anchor;
+        let range = self.ui.visual_range;
+        self.cancel_visual_mode();
+        let (start, end) = range?;
+        let rows = (start..=end)
+            .filter_map(|i| self.core.get_package(i).cloned())
+            .collect();
+        Some((anchor?, rows))
+    }
+
+    fn selection_label(&self, ids: &[PackageId]) -> String {
+        match ids {
+            [one] => format!("'{}'", self.core.cache().display_name_of(*one)),
+            many => format!("{} packages", many.len()),
         }
     }
 
-    fn mark_selected_packages(&mut self) {
-        let anchor_idx = match self.ui.selection_anchor {
-            Some(idx) => idx,
-            None => {
-                self.cancel_visual_mode();
+    /// Mark the selection for install/upgrade - or unmark it, if the anchor
+    /// row is marked
+    fn mark_selection(&mut self) {
+        let Some((anchor, rows)) = self.take_selection() else {
+            return;
+        };
+        let anchor_marked = self
+            .core
+            .get_package(anchor)
+            .is_some_and(|p| p.status.is_marked() || p.status == PackageStatus::Held);
+
+        if anchor_marked {
+            let ids: Vec<PackageId> = rows
+                .iter()
+                .filter(|p| self.core.intent_of(p.id).is_some())
+                .map(|p| p.id)
+                .collect();
+            if ids.is_empty() {
+                self.status_message = "No user-marked packages in selection".to_string();
                 return;
             }
-        };
-
-        // Anchor row's state determines the operation for the entire selection
-        let anchor_is_marked = self
-            .core
-            .get_package(anchor_idx)
-            .map(|p| p.status.is_marked())
-            .unwrap_or(false);
-
-        // Collect selected indices from visual range before clearing
-        let selected_indices: Vec<usize> = match self.ui.visual_range {
-            Some((start, end)) => (start..=end).collect(),
-            None => Vec::new(),
-        };
-
-        self.ui.visual_range = None;
-        self.ui.selection_anchor = None;
-        self.ui.visual_mode = false;
-
-        if anchor_is_marked {
-            self.bulk_unmark(&selected_indices);
+            let label = self.selection_label(&ids);
+            self.run_mark_action(&ids, |core| {
+                core.edit_intents(ids.iter().map(|&id| (id, None)));
+                Ok(format!("Unmarked {label}"))
+            });
         } else {
-            self.bulk_mark(&selected_indices);
+            let ids: Vec<PackageId> = rows
+                .iter()
+                .filter(|p| {
+                    self.core.intent_of(p.id).is_none()
+                        && matches!(
+                            p.status,
+                            PackageStatus::Upgradable | PackageStatus::NotInstalled
+                        )
+                })
+                .map(|p| p.id)
+                .collect();
+            if ids.is_empty() {
+                self.status_message = "No packages to mark in selection".to_string();
+                return;
+            }
+            let label = self.selection_label(&ids);
+            self.run_mark_action(&ids, |core| {
+                core.edit_intents(ids.iter().map(|&id| (id, Some(UserIntent::Install))));
+                Ok(format!("Marked {label} for install/upgrade"))
+            });
         }
     }
 
-    fn bulk_mark(&mut self, selected_indices: &[usize]) {
-        // Snapshot currently planned packages BEFORE any marks
-        let previously_planned: HashSet<PackageId> = self
-            .core
-            .planned_changes()
-            .map(|changes| changes.iter().map(|c| c.package).collect())
-            .unwrap_or_default();
-
-        // Filter to unmarked + (Upgradable | NotInstalled)
-        let ids_to_mark: Vec<PackageId> = selected_indices
+    /// Mark every installed package in the selection for removal
+    fn remove_selection(&mut self) {
+        let Some((_, rows)) = self.take_selection() else {
+            return;
+        };
+        let ids: Vec<PackageId> = rows
             .iter()
-            .filter_map(|&idx| self.core.get_package(idx))
             .filter(|p| {
-                !p.status.is_marked()
-                    && (p.status == PackageStatus::Upgradable
-                        || p.status == PackageStatus::NotInstalled)
+                !p.installed_version.is_empty()
+                    && self.core.intent_of(p.id) != Some(UserIntent::Remove)
             })
             .map(|p| p.id)
             .collect();
-
-        if ids_to_mark.is_empty() {
-            self.status_message = "No packages to mark in selection".to_string();
+        if ids.is_empty() {
+            self.status_message = "No installed packages to remove in selection".to_string();
             return;
         }
-
-        for &id in &ids_to_mark {
-            self.core.mark_install(id);
-        }
-
-        // Single compute_plan + rebuild for all marks
-        self.core.compute_plan();
-        self.col_widths = self.core.rebuild_list();
-
-        // Diff planned changes to find new dependencies
-        let marked_id_set: HashSet<PackageId> = ids_to_mark.iter().copied().collect();
-        let mut additional_installs = Vec::new();
-        let mut additional_upgrades = Vec::new();
-        let mut additional_removes = Vec::new();
-        let mut download_size = 0u64;
-
-        if let Some(changes) = self.core.planned_changes() {
-            let cache = self.core.cache();
-            for change in changes {
-                download_size += change.download_size;
-
-                // Skip packages the user explicitly selected
-                if marked_id_set.contains(&change.package) {
-                    continue;
-                }
-                // Skip packages already planned before this bulk mark
-                if previously_planned.contains(&change.package) {
-                    continue;
-                }
-
-                let name = cache
-                    .fullname_of(change.package)
-                    .map(|n| cache.display_name(n).to_string())
-                    .unwrap_or_else(|| format!("(unknown:{})", change.package.index()));
-
-                match change.action {
-                    ChangeAction::Install => additional_installs.push(name),
-                    ChangeAction::Upgrade | ChangeAction::Downgrade => {
-                        additional_upgrades.push(name);
-                    }
-                    ChangeAction::Remove => additional_removes.push(name),
-                }
-            }
-        }
-
-        // Only show confirmation for non-upgrade extras (installs, removes).
-        // Pure upgrade deps are expected and don't need confirmation.
-        let needs_confirm = !additional_installs.is_empty() || !additional_removes.is_empty();
-
-        if !needs_confirm {
-            self.refresh_ui_state();
-            self.update_status_message();
-            return;
-        }
-
-        let summary_name = if ids_to_mark.len() == 1 {
-            self.core
-                .cache()
-                .fullname_of(ids_to_mark[0])
-                .map(|n| self.core.cache().display_name(n).to_string())
-                .unwrap_or_else(|| "1 package".to_string())
-        } else {
-            format!("{} packages", ids_to_mark.len())
-        };
-
-        self.mark_preview = Some(MarkPreview::Mark {
-            package_name: summary_name,
-            is_upgrade: false,
-            additional_installs,
-            additional_upgrades,
-            additional_removes,
-            download_size,
-            bulk_acted_ids: ids_to_mark,
+        let label = self.selection_label(&ids);
+        self.run_mark_action(&ids, |core| {
+            core.edit_intents(ids.iter().map(|&id| (id, Some(UserIntent::Remove))));
+            Ok(format!("Marked {label} for removal"))
         });
-        self.mark_preview_scroll = 0;
-        self.state = AppState::ShowingMarkConfirm;
-    }
-
-    fn bulk_unmark(&mut self, selected_indices: &[usize]) {
-        // Snapshot all currently marked packages
-        let marked_before: HashSet<PackageId> = self
-            .core
-            .list()
-            .iter()
-            .filter(|p| p.status.is_marked())
-            .map(|p| p.id)
-            .collect();
-
-        // Only unmark user-marked packages (deps vanish automatically via compute_plan)
-        let ids_to_unmark: Vec<PackageId> = selected_indices
-            .iter()
-            .filter_map(|&idx| self.core.get_package(idx))
-            .filter(|p| p.status.is_marked() && self.core.is_user_marked(p.id))
-            .map(|p| p.id)
-            .collect();
-
-        if ids_to_unmark.is_empty() {
-            self.status_message = "No user-marked packages to unmark in selection".to_string();
-            return;
-        }
-
-        for &id in &ids_to_unmark {
-            self.core.unmark(id);
-        }
-
-        // Single compute_plan + rebuild
-        self.core.compute_plan();
-        self.col_widths = self.core.rebuild_list();
-
-        // Find cascade-unmarked packages (deps no longer needed)
-        let unmarked_id_set: HashSet<PackageId> = ids_to_unmark.iter().copied().collect();
-        let cascade_unmarked: Vec<String> = {
-            let marked_after: HashSet<PackageId> = self
-                .core
-                .list()
-                .iter()
-                .filter(|p| p.status.is_marked())
-                .map(|p| p.id)
-                .collect();
-            let cache = self.core.cache();
-            marked_before
-                .iter()
-                .filter(|id| !marked_after.contains(id) && !unmarked_id_set.contains(id))
-                .filter_map(|id| {
-                    cache
-                        .fullname_of(*id)
-                        .map(|n| cache.display_name(n).to_string())
-                })
-                .collect()
-        };
-
-        if cascade_unmarked.is_empty() {
-            self.refresh_ui_state();
-            self.update_status_message();
-            return;
-        }
-
-        let summary_name = if ids_to_unmark.len() == 1 {
-            self.core
-                .cache()
-                .fullname_of(ids_to_unmark[0])
-                .map(|n| self.core.cache().display_name(n).to_string())
-                .unwrap_or_else(|| "1 package".to_string())
-        } else {
-            format!("{} packages", ids_to_unmark.len())
-        };
-
-        self.mark_preview = Some(MarkPreview::Unmark {
-            package_name: summary_name,
-            was_user_marked: true,
-            also_unmarked: cascade_unmarked,
-            bulk_acted_ids: ids_to_unmark,
-        });
-        self.mark_preview_scroll = 0;
-        self.state = AppState::ShowingMarkConfirm;
     }
 
     // === Navigation ===
 
-    pub fn move_package_selection(&mut self, delta: i32) {
-        if self.core.package_count() == 0 {
+    fn move_package_selection(&mut self, delta: isize) {
+        let count = self.core.package_count();
+        if count == 0 {
             return;
         }
-        let current = self.ui.table_state.selected().unwrap_or(0) as i64;
-        let new_idx =
-            (current + delta as i64).clamp(0, self.core.package_count() as i64 - 1) as usize;
+        let current = self.ui.table_state.selected().unwrap_or(0);
+        let new_idx = current.saturating_add_signed(delta).min(count - 1);
         self.ui.table_state.select(Some(new_idx));
         self.center_scroll_offset();
-        self.details.scroll = 0;
+        self.details.scroll.home();
         self.update_cached_deps();
-    }
-
-    pub fn select_first_package(&mut self) {
-        self.move_package_selection(-(self.core.package_count() as i32));
-    }
-
-    pub fn select_last_package(&mut self) {
-        self.move_package_selection(self.core.package_count() as i32);
+        self.update_visual_selection();
     }
 
     /// Set the table viewport offset so the selected row stays vertically centered.
@@ -799,380 +768,226 @@ impl App {
     /// When the selection is in the top half of the list or the bottom half,
     /// the highlight moves normally (can't center without content above/below).
     /// In between, the list scrolls under a pinned highlight at the midpoint.
-    fn center_scroll_offset(&mut self) {
+    pub fn center_scroll_offset(&mut self) {
         let visible = self.ui.table_visible_rows;
         if visible == 0 {
             return;
         }
         let selected = self.ui.table_state.selected().unwrap_or(0);
-        let total = self.core.package_count();
-        let half = visible / 2;
-        let max_offset = total.saturating_sub(visible);
-        let offset = selected.saturating_sub(half).min(max_offset);
-        *self.ui.table_state.offset_mut() = offset;
+        let max_offset = self.core.package_count().saturating_sub(visible);
+        *self.ui.table_state.offset_mut() = selected.saturating_sub(visible / 2).min(max_offset);
     }
 
-    pub fn next_details_tab(&mut self) {
-        self.details.tab = match self.details.tab {
-            DetailsTab::Info => DetailsTab::Dependencies,
-            DetailsTab::Dependencies => DetailsTab::ReverseDeps,
-            DetailsTab::ReverseDeps => DetailsTab::Info,
-        };
-        self.details.scroll = 0;
+    /// Step the details tab forward by `steps` (mod 3)
+    fn switch_details_tab(&mut self, steps: usize) {
+        const TABS: [DetailsTab; 3] = [
+            DetailsTab::Info,
+            DetailsTab::Dependencies,
+            DetailsTab::ReverseDeps,
+        ];
+        let current = TABS
+            .iter()
+            .position(|&t| t == self.details.tab)
+            .unwrap_or(0);
+        self.details.tab = TABS[(current + steps) % TABS.len()];
+        self.details.scroll.home();
     }
 
-    pub fn prev_details_tab(&mut self) {
-        self.details.tab = match self.details.tab {
-            DetailsTab::Info => DetailsTab::ReverseDeps,
-            DetailsTab::Dependencies => DetailsTab::Info,
-            DetailsTab::ReverseDeps => DetailsTab::Dependencies,
-        };
-        self.details.scroll = 0;
-    }
-
-    pub fn cycle_focus(&mut self) {
-        self.ui.focused_pane = match self.ui.focused_pane {
-            FocusedPane::Filters => FocusedPane::Packages,
-            FocusedPane::Packages => FocusedPane::Details,
-            FocusedPane::Details => FocusedPane::Filters,
-        };
-    }
-
-    pub fn cycle_focus_back(&mut self) {
-        self.ui.focused_pane = match self.ui.focused_pane {
-            FocusedPane::Filters => FocusedPane::Details,
-            FocusedPane::Packages => FocusedPane::Filters,
-            FocusedPane::Details => FocusedPane::Packages,
-        };
+    /// Step pane focus forward by `steps` (mod 3)
+    fn cycle_focus(&mut self, steps: usize) {
+        const PANES: [FocusedPane; 3] = [
+            FocusedPane::Filters,
+            FocusedPane::Packages,
+            FocusedPane::Details,
+        ];
+        let current = PANES
+            .iter()
+            .position(|&p| p == self.ui.focused_pane)
+            .unwrap_or(0);
+        self.ui.focused_pane = PANES[(current + steps) % PANES.len()];
     }
 
     // === Modals ===
 
-    pub fn show_changelog(&mut self) {
-        let pkg_name = match self.selected_package() {
-            Some(p) => p.name.clone(),
-            None => {
-                self.status_message = "No package selected".to_string();
-                return;
-            }
+    fn show_changelog(&mut self) {
+        let Some(name) = self.selected_display_name() else {
+            self.status_message = "No package selected".to_string();
+            return;
         };
-
-        self.modals.changelog_content.clear();
-        self.modals
-            .changelog_content
-            .push(format!("Loading changelog for {pkg_name}..."));
-        self.modals.changelog_scroll = 0;
-
-        match self.core.fetch_changelog(&pkg_name) {
-            Ok(lines) => {
-                self.modals.changelog_content = lines;
-            }
-            Err(e) => {
-                self.modals.changelog_content.clear();
-                self.modals.changelog_content.push(e);
-            }
-        }
-
+        self.modals.changelog_content = match fetch_changelog(&name) {
+            Ok(lines) => lines,
+            Err(e) => vec![e.to_string()],
+        };
+        self.modals.changelog_title = name;
+        self.modals.changelog = ScrollView::default();
         self.state = AppState::ShowingChangelog;
     }
 
-    pub fn show_settings(&mut self) {
-        self.settings_selection = 0;
-        self.state = AppState::ShowingSettings;
-    }
-
-    pub fn toggle_setting(&mut self) {
+    fn toggle_setting(&mut self) {
         let all_cols = Column::all();
         let col_count = all_cols.len();
-        if self.settings_selection < col_count {
-            let col = all_cols[self.settings_selection];
+        if let Some(&col) = all_cols.get(self.settings_selection) {
             if !self.settings.visible_columns.remove(&col) {
                 self.settings.visible_columns.insert(col);
             }
-        } else if self.settings_selection == col_count {
+            return;
+        }
+        if self.settings_selection == col_count {
             let all = SortBy::all();
             let idx = all
                 .iter()
-                .position(|&s| s == self.settings.sort_by)
+                .position(|&s| s == self.settings.sort.sort_by)
                 .unwrap_or(0);
-            self.settings.sort_by = all[(idx + 1) % all.len()];
-            self.core
-                .set_sort(self.settings.sort_by, self.settings.sort_ascending);
-            self.col_widths = self.core.rebuild_list();
-        } else if self.settings_selection == col_count + 1 {
-            self.settings.sort_ascending = !self.settings.sort_ascending;
-            self.core
-                .set_sort(self.settings.sort_by, self.settings.sort_ascending);
-            self.col_widths = self.core.rebuild_list();
+            self.settings.sort.sort_by = all[(idx + 1) % all.len()];
+        } else {
+            self.settings.sort.ascending = !self.settings.sort.ascending;
         }
+        self.core.set_sort(self.settings.sort);
     }
 
     pub fn settings_item_count() -> usize {
         Column::all().len() + 2
     }
 
-    pub fn show_changes_preview(&mut self) {
-        if self.has_pending_changes() {
-            // Compute plan to get full changeset
-            self.core.compute_plan();
+    fn show_changes_preview(&mut self) {
+        if self.core.has_intents() {
             self.state = AppState::ShowingChanges;
-            self.modals.changes_scroll = 0;
+            self.modals.changes = ScrollView::default();
+            self.status_message = self.plan_status();
         } else {
             self.status_message = "No changes to apply".to_string();
         }
     }
 
-    // === Scrolling ===
-
-    pub fn scroll_changelog(&mut self, delta: i32) {
-        let max = self.modals.changelog_content.len().saturating_sub(1);
-        self.modals.changelog_scroll =
-            clamped_scroll(self.modals.changelog_scroll.into(), delta, max) as u16;
-    }
-
-    pub fn scroll_changes(&mut self, delta: i32) {
-        let max = self.changes_line_count().saturating_sub(5);
-        self.modals.changes_scroll =
-            clamped_scroll(self.modals.changes_scroll.into(), delta, max) as u16;
-    }
-
-    pub fn scroll_mark_confirm(&mut self, delta: i32) {
-        let max = self.mark_confirm_line_count().saturating_sub(10);
-        self.mark_preview_scroll = clamped_scroll(self.mark_preview_scroll, delta, max);
-    }
-
-    pub fn scroll_output(&mut self, delta: i32) {
-        let max = self.output_lines.len().saturating_sub(1);
-        self.output_scroll = clamped_scroll(self.output_scroll.into(), delta, max) as u16;
-    }
-
-    pub fn changes_line_count(&self) -> usize {
-        match self.core.planned_changes() {
-            Some(changes) => {
-                let mut lines = 2; // header + blank line
-
-                // Count changes grouped by action/reason category
-                let categories = [
-                    changes
-                        .iter()
-                        .filter(|c| {
-                            c.action == ChangeAction::Upgrade
-                                && c.reason == ChangeReason::UserRequested
-                        })
-                        .count(),
-                    changes
-                        .iter()
-                        .filter(|c| {
-                            c.action == ChangeAction::Install
-                                && c.reason == ChangeReason::UserRequested
-                        })
-                        .count(),
-                    changes
-                        .iter()
-                        .filter(|c| {
-                            c.action == ChangeAction::Upgrade
-                                && c.reason == ChangeReason::Dependency
-                        })
-                        .count(),
-                    changes
-                        .iter()
-                        .filter(|c| {
-                            c.action == ChangeAction::Install
-                                && c.reason == ChangeReason::Dependency
-                        })
-                        .count(),
-                    changes
-                        .iter()
-                        .filter(|c| {
-                            c.action == ChangeAction::Remove
-                                && c.reason == ChangeReason::UserRequested
-                        })
-                        .count(),
-                    changes
-                        .iter()
-                        .filter(|c| {
-                            c.action == ChangeAction::Remove && c.reason == ChangeReason::AutoRemove
-                        })
-                        .count(),
-                ];
-
-                for count in categories {
-                    if count > 0 {
-                        lines += 1 + count + 1; // header + items + blank
-                    }
-                }
-
-                lines += 3; // blank + download size + disk change
-                lines
-            }
-            None => 5,
-        }
-    }
-
-    pub fn mark_confirm_line_count(&self) -> usize {
-        match self.mark_preview {
-            Some(MarkPreview::Mark {
-                ref additional_installs,
-                ref additional_upgrades,
-                ref additional_removes,
-                ..
-            }) => {
-                let mut count = 2; // Header lines
-                if !additional_installs.is_empty() {
-                    count += 1 + additional_installs.len();
-                }
-                if !additional_upgrades.is_empty() {
-                    count += 1 + additional_upgrades.len();
-                }
-                if !additional_removes.is_empty() {
-                    count += 1 + additional_removes.len();
-                }
-                count + 2 // Footer lines
-            }
-            Some(MarkPreview::Unmark {
-                ref also_unmarked, ..
-            }) => {
-                let mut count = 2; // Header lines
-                if !also_unmarked.is_empty() {
-                    count += 1 + also_unmarked.len();
-                }
-                count + 2 // Footer lines
-            }
-            None => 0,
-        }
-    }
-
     // === Status message ===
 
-    pub fn update_status_message(&mut self) {
-        let mark_count = self.core.user_mark_count();
-        if mark_count > 0 {
-            self.status_message = format!(
-                "{mark_count} packages marked | {} upgradable | Press 'a' to apply",
-                self.core.upgradable_count()
-            );
-        } else {
-            self.status_message = format!("{} packages upgradable", self.core.upgradable_count());
+    /// Plan problems, or the default status line
+    fn plan_status(&self) -> String {
+        if let Some(problems) = self.core.plan_problems()
+            && let Some(summary) = problems.summary()
+        {
+            return if problems.errors.is_empty() {
+                format!("Warning: {summary}")
+            } else {
+                format!("Cannot apply: {summary}")
+            };
         }
+        let upgradable = self.core.upgradable_count();
+        match self.core.intent_count() {
+            0 => format!("{upgradable} packages upgradable"),
+            n => format!(
+                "{n} packages marked | {upgradable} upgradable | Press '{}' to apply",
+                keymap::key_label(Context::Packages, Action::ReviewChanges)
+            ),
+        }
+    }
+
+    pub fn update_status_message(&mut self) {
+        let apt_errors = self.core.take_apt_errors();
+        self.status_message = if apt_errors.is_empty() {
+            self.plan_status()
+        } else {
+            format!("APT error: {}", apt_errors.join("; "))
+        };
     }
 
     // === System operations ===
 
-    /// Commit planned changes with live TUI progress display.
-    ///
-    /// Creates its own `/dev/tty`-backed terminal for the progress modal and
-    /// redirects stdout/stderr to `/dev/null` so dpkg output is suppressed.
-    pub fn commit_changes_live(&mut self) -> Result<()> {
-        use std::cell::RefCell;
-        use std::rc::Rc;
+    /// Commit the plan with live progress. The progress modal draws on its
+    /// own `/dev/tty` terminal while stdout/stderr are captured, and the
+    /// captured output is shown afterwards in the Done view. Failures are
+    /// reported there, not returned.
+    pub fn commit_changes_live(&mut self) {
+        self.state = AppState::Done;
+        self.output_lines.clear();
+        self.modals.output = ScrollView::default();
 
-        if let Some(msg) = check_apt_lock() {
-            self.status_message = msg;
-            self.state = AppState::Listing;
-            return Ok(());
-        }
+        let progress_state = match ProgressState::new("Applying Changes") {
+            Ok(state) => Rc::new(RefCell::new(state)),
+            Err(e) => {
+                self.status_message = format!("Cannot open /dev/tty for progress: {e}");
+                return;
+            }
+        };
+        let mut acquire_progress = rust_apt::progress::AcquireProgress::new(
+            TuiAcquireProgress::new(Rc::clone(&progress_state)),
+        );
+        let mut install_progress = rust_apt::progress::InstallProgress::new(
+            TuiInstallProgress::new(Rc::clone(&progress_state)),
+        );
 
-        self.state = AppState::Upgrading;
+        // Keep existing config files without prompting: dpkg cannot ask,
+        // since its output is being captured.
+        rust_apt::config::Config::new()
+            .set_vector("Dpkg::Options", &vec!["--force-confdef", "--force-confold"]);
 
-        let progress_state = Rc::new(RefCell::new(ProgressState::new("Applying Changes")?));
-
-        let acq = TuiAcquireProgress::new(Rc::clone(&progress_state));
-        let inst = TuiInstallProgress::new(Rc::clone(&progress_state));
-
-        let mut acquire_progress = rust_apt::progress::AcquireProgress::new(acq);
-        let mut install_progress = rust_apt::progress::InstallProgress::new(inst);
-
-        // Tell dpkg to keep existing config files without prompting.
-        // Without this, dpkg's conffile prompt would deadlock since we've
-        // captured stdout and it can't interact with the user.
-        let config = rust_apt::config::Config::new();
-        config.set_vector("Dpkg::Options", &vec!["--force-confdef", "--force-confold"]);
-
-        // Suppress debconf prompts (use package defaults).
-        // Safety: we're single-threaded, no concurrent env reads.
-        unsafe {
-            std::env::set_var("DEBIAN_FRONTEND", "noninteractive");
-        }
-
-        // Redirect stdout/stderr to a temp file so dpkg output is captured.
-        // The progress terminal writes to /dev/tty directly, bypassing fd 1.
-        let redirect = StdioRedirect::capture()?;
-
+        let redirect = match StdioRedirect::capture() {
+            Ok(redirect) => redirect,
+            Err(e) => {
+                self.status_message = format!("Cannot capture apt output: {e}");
+                return;
+            }
+        };
         let result = self
             .core
-            .commit_with_progress(&mut acquire_progress, &mut install_progress);
+            .commit(&mut acquire_progress, &mut install_progress);
+        let (output, restored) = redirect.finish();
 
-        // Read captured apt/dpkg output before restoring fds
-        self.output_lines = redirect.output();
-        self.output_scroll = 0;
-
-        match result {
-            Ok(()) => {
-                self.state = AppState::Done;
-                self.status_message =
-                    "Changes applied successfully. Space to continue.".to_string();
-            }
-            Err(e) => {
-                self.state = AppState::Done;
-                self.status_message = format!("Error: {e}. Space to continue.");
-            }
+        self.output_lines = output;
+        let progress_errors = progress_state.borrow().errors().to_vec();
+        if !progress_errors.is_empty() {
+            self.output_lines.push(String::new());
+            self.output_lines.push("Errors:".to_string());
+            self.output_lines.extend(progress_errors);
+        }
+        if let Err(e) = restored {
+            self.output_lines
+                .push(format!("Failed to restore stdout/stderr: {e}"));
         }
 
-        // redirect drops here, restoring stdout/stderr and cleaning up temp file
-        Ok(())
+        self.status_message = match result {
+            Ok(()) => "Changes applied successfully.".to_string(),
+            Err(e) => format!("Error: {e}"),
+        };
     }
 
-    /// Run `apt update` with live TUI progress display.
-    ///
-    /// Creates its own `/dev/tty`-backed terminal for the progress modal.
-    pub fn update_packages_live(&mut self) -> Result<()> {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-
-        if let Some(msg) = check_apt_lock() {
-            self.status_message = msg;
-            return Ok(());
-        }
-
-        let progress_state = Rc::new(RefCell::new(ProgressState::new("Updating Package Lists")?));
-
-        let acq = TuiAcquireProgress::new(Rc::clone(&progress_state));
-        let mut acquire_progress = rust_apt::progress::AcquireProgress::new(acq);
-
-        match self.core.update_with_progress(&mut acquire_progress) {
-            Ok(()) => {
-                // Rebuild package list and counts after update
-                self.core.rebuild_list();
-                self.core.update_cache_counts();
-                self.apply_current_filter();
-                self.update_status_message();
-            }
+    /// Run `apt update` with live progress. Marks are carried across.
+    pub fn update_packages_live(&mut self) {
+        let progress_state = match ProgressState::new("Updating Package Lists") {
+            Ok(state) => Rc::new(RefCell::new(state)),
             Err(e) => {
-                self.status_message = format!("Update failed: {e}");
+                self.status_message = format!("Cannot open /dev/tty for progress: {e}");
+                return;
             }
-        }
+        };
+        let mut acquire_progress = rust_apt::progress::AcquireProgress::new(
+            TuiAcquireProgress::new(Rc::clone(&progress_state)),
+        );
 
-        Ok(())
-    }
-
-    pub fn refresh_cache(&mut self) -> Result<()> {
-        if let Some(msg) = check_apt_lock() {
-            self.status_message = msg;
-            return Ok(());
-        }
-
-        if let Err(e) = self.core.refresh() {
-            self.status_message = format!("Refresh failed: {e}");
-            return Ok(());
-        }
-
+        let (lost, result) = self.core.update(&mut acquire_progress);
         self.refresh_ui_state();
         self.update_status_message();
-        Ok(())
+        if !lost.is_empty() {
+            self.status_message = format!(
+                "Dropped marks for packages that no longer exist: {}",
+                lost.join(", ")
+            );
+        }
+        if let Err(e) = result {
+            self.status_message = format!("Update failed: {e}");
+        }
     }
 }
 
-/// Apply a clamped scroll delta to a current position.
-fn clamped_scroll(current: usize, delta: i32, max: usize) -> usize {
-    (current as i32 + delta).clamp(0, max as i32) as usize
+/// Apply a navigation action to a scroll view (other actions are ignored)
+fn scroll(view: &mut ScrollView, action: Action) {
+    match action {
+        Action::Up => view.scroll_by(-1),
+        Action::Down => view.scroll_by(1),
+        Action::PageUp => view.page_by(-1),
+        Action::PageDown => view.page_by(1),
+        Action::Home => view.home(),
+        Action::End => view.end(),
+        _ => {}
+    }
 }

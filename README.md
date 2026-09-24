@@ -8,9 +8,9 @@ Built with LLMs. See [LLM.md](https://github.com/folknor/synh8/blob/master/LLM.m
 
 ## Features
 
-- Browse, search, install, upgrade, and remove packages from the terminal
+- Browse, search, install, upgrade, remove and hold packages from the terminal
 - Full-text search (FTS5) across package names and descriptions
-- Vim-style navigation and visual mode for batch-marking packages
+- `j`/`k` navigation and vim-style visual mode for batch-marking packages
 - Automatic dependency resolution with preview before committing
 - Live progress display for downloads and installs
 - Run `apt update` with real-time download progress
@@ -20,10 +20,12 @@ Built with LLMs. See [LLM.md](https://github.com/folknor/synh8/blob/master/LLM.m
 ## APT locking
 
 Unlike apt, aptitude, and synaptic, synh8 does not hold the dpkg/APT lock
-while running. It checks the lock on startup and before committing changes,
-but does not prevent other tools from modifying package state while the UI
-is open. If you run `apt install` in another terminal while synh8 is open,
-synh8 won't notice. You're root. You know what you're doing.
+while running. It only takes the lock while `apt update` runs and while
+changes are applied, and reports it if another tool holds it then. It does
+not prevent other tools from modifying package state while the UI is open:
+if you run `apt install` in another terminal while synh8 is open, synh8
+won't notice until the next update or apply. You're root. You know what
+you're doing.
 
 ## Usage
 
@@ -35,23 +37,13 @@ sudo synh8
 
 ## Keybindings
 
-Arrow keys, PgUp/PgDn, Home/End act on the focused pane.
+Arrow keys (or `j`/`k`), PgUp/PgDn, Home/End act on the focused pane.
 `Tab`/`Shift+Tab` cycles focus between Filters, Packages, and Details.
+In the Packages pane, `Space` toggles a mark, `-` marks for removal, `=`
+holds, `v` starts a visual selection and `a` reviews and applies. The help
+bar at the bottom shows the keys for the current screen.
 
-| Key | Context | Action |
-|-----|---------|--------|
-| `s` | Global | Search |
-| `u` | Global | Run apt update |
-| `F2` | Global | Settings (columns, sort) |
-| `Esc` | Global | Clear search / cancel visual mode |
-| `Space` | Packages | Toggle mark |
-| `v` | Packages | Visual mode (multi-select) |
-| `c` | Packages | View changelog |
-| `a` | Packages | Apply pending changes |
-| `x` | Packages | Mark all upgradable |
-| `z` | Packages | Unmark all |
-| `,`/`.` | Details | Switch tab (Info/Deps/RDeps) |
-| `q` | Any | Quit |
+The full reference is [docs/keybindings.md](docs/keybindings.md).
 
 ## Installation
 

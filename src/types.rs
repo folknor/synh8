@@ -1,14 +1,17 @@
 //! Common types used throughout the application
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::prelude::*;
+use rust_apt::Marked;
 
 // ============================================================================
 // Core API Types (Typestate Pattern)
 // ============================================================================
 
-/// Opaque handle to a package. Valid only for the current cache generation.
+/// Opaque handle to a package. Valid only for the cache generation that
+/// issued it: `AptCache::reload()` renumbers every package, so anything that
+/// must survive a reload is carried across by full name instead.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct PackageId(pub(crate) u32);
 
@@ -19,29 +22,29 @@ impl PackageId {
     }
 }
 
-/// What the user explicitly wants for a package
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+/// What the user explicitly wants for a package. Absence from the intent map
+/// means "no opinion": APT decides.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum UserIntent {
-    /// No user action - follow default behavior
-    #[default]
-    Default,
-    /// User explicitly wants this installed/upgraded
+    /// Install, or upgrade to the candidate version
     Install,
-    /// User explicitly wants this removed
+    /// Remove (without purging configuration files)
     Remove,
-    /// User explicitly wants to keep current version (prevent auto-changes)
+    /// Keep the current state: the resolver may not install, upgrade or
+    /// remove this package, and "mark all upgrades" skips it
     Hold,
 }
+
+/// A snapshot of every user intent, used to undo a mark action wholesale.
+pub type IntentSnapshot = HashMap<PackageId, UserIntent>;
 
 /// Why a package is changing
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ChangeReason {
     /// User explicitly requested this
     UserRequested,
-    /// Required as a dependency of a user request
+    /// Pulled in, or pushed out, by the resolver to satisfy a user request
     Dependency,
-    /// Will be auto-removed (orphan dependency)
-    AutoRemove,
 }
 
 /// Type of change to a package
@@ -49,11 +52,61 @@ pub enum ChangeReason {
 pub enum ChangeAction {
     Install,
     Upgrade,
-    Remove,
     Downgrade,
+    Reinstall,
+    Remove,
 }
 
-/// A computed change from the plan
+impl ChangeAction {
+    /// Classify an APT mark. `None` for marks that change nothing on disk.
+    pub fn from_marked(marked: Marked) -> Option<Self> {
+        match marked {
+            Marked::NewInstall | Marked::Install => Some(Self::Install),
+            Marked::Upgrade => Some(Self::Upgrade),
+            Marked::Downgrade => Some(Self::Downgrade),
+            Marked::ReInstall => Some(Self::Reinstall),
+            Marked::Remove | Marked::Purge => Some(Self::Remove),
+            Marked::Keep | Marked::Held | Marked::None => None,
+        }
+    }
+
+    /// Display status of a package carrying this change
+    pub fn status(self) -> PackageStatus {
+        match self {
+            Self::Install | Self::Reinstall => PackageStatus::MarkedForInstall,
+            Self::Upgrade => PackageStatus::MarkedForUpgrade,
+            Self::Downgrade => PackageStatus::MarkedForDowngrade,
+            Self::Remove => PackageStatus::MarkedForRemove,
+        }
+    }
+
+    /// True for changes that fetch a package
+    pub fn downloads(self) -> bool {
+        !matches!(self, Self::Remove)
+    }
+
+    /// Heading used when listing changes of this kind
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Install => "Install",
+            Self::Upgrade => "Upgrade",
+            Self::Downgrade => "Downgrade",
+            Self::Reinstall => "Reinstall",
+            Self::Remove => "Remove",
+        }
+    }
+
+    pub fn all() -> &'static [ChangeAction] {
+        &[
+            Self::Upgrade,
+            Self::Install,
+            Self::Downgrade,
+            Self::Reinstall,
+            Self::Remove,
+        ]
+    }
+}
+
 /// A planned change to a package. Name is derived from PackageId, not stored.
 #[derive(Clone, Debug)]
 pub struct PlannedChange {
@@ -62,6 +115,35 @@ pub struct PlannedChange {
     pub reason: ChangeReason,
     pub download_size: u64,
     pub size_change: i64,
+}
+
+/// Problems reported by the dependency resolver (or by APT while planning).
+/// Errors make the plan unappliable; warnings are informational.
+#[derive(Clone, Debug, Default)]
+pub struct PlanProblems {
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl PlanProblems {
+    pub fn is_empty(&self) -> bool {
+        self.errors.is_empty() && self.warnings.is_empty()
+    }
+
+    /// One-line summary. Errors take priority over warnings: a real error is
+    /// always the headline, and warnings only surface when there are none.
+    pub fn summary(&self) -> Option<String> {
+        let (messages, label) = if self.errors.is_empty() {
+            (&self.warnings, "warning")
+        } else {
+            (&self.errors, "error")
+        };
+        match messages.len() {
+            0 => None,
+            1 => Some(messages[0].clone()),
+            n => Some(format!("{}; and {} more {label}(s)", messages[0], n - 1)),
+        }
+    }
 }
 
 // ============================================================================
@@ -79,17 +161,11 @@ pub struct Planned {
     pub changes: Vec<PlannedChange>,
     pub download_size: u64,
     pub install_size_change: i64,
-    pub errors: Vec<String>,
+    pub problems: PlanProblems,
 }
 
-/// Marker trait for states where the cache is readable
-pub trait ReadableState {}
-impl ReadableState for Clean {}
-impl ReadableState for Dirty {}
-impl ReadableState for Planned {}
-
 // ============================================================================
-// Legacy Types (for UI compatibility during migration)
+// Display types
 // ============================================================================
 
 /// Package status - no distinction between user-marked and dependency
@@ -100,24 +176,23 @@ pub enum PackageStatus {
     NotInstalled, //   Package is not installed, no changes pending
     Upgradable,   // ↑ Package can be upgraded (yellow)
     // Marked states (all marked packages look identical)
-    MarkedForInstall, // + Package will be installed
-    MarkedForUpgrade, // ↑ Package will be upgraded (green)
-    MarkedForRemove,  // - Package will be removed
-    // Other
-    Keep,   // = Package kept at current version
-    Broken, // ✗ Package is broken
+    MarkedForInstall,   // + Package will be installed
+    MarkedForUpgrade,   // ↑ Package will be upgraded (green)
+    MarkedForDowngrade, // ↓ Package will be downgraded
+    MarkedForRemove,    // - Package will be removed
+    Held,               // = User holds the package at its current state
 }
 
 impl PackageStatus {
     pub fn symbol(&self) -> &'static str {
         match self {
             Self::Upgradable | Self::MarkedForUpgrade => "↑",
+            Self::MarkedForDowngrade => "↓",
             Self::MarkedForInstall => "+",
             Self::MarkedForRemove => "-",
-            Self::Keep => "=",
+            Self::Held => "=",
             Self::Installed => "·",
             Self::NotInstalled => " ",
-            Self::Broken => "✗",
         }
     }
 
@@ -126,11 +201,25 @@ impl PackageStatus {
             Self::Upgradable => Color::Yellow,
             Self::MarkedForUpgrade => Color::Green,
             Self::MarkedForInstall => Color::Green,
+            Self::MarkedForDowngrade => Color::Magenta,
             Self::MarkedForRemove => Color::Red,
-            Self::Keep => Color::Blue,
+            Self::Held => Color::Blue,
             Self::Installed => Color::DarkGray,
             Self::NotInstalled => Color::Gray,
-            Self::Broken => Color::LightRed,
+        }
+    }
+
+    /// Human-readable name for the details pane
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Installed => "Installed",
+            Self::NotInstalled => "Not installed",
+            Self::Upgradable => "Upgradable",
+            Self::MarkedForInstall => "Marked for install",
+            Self::MarkedForUpgrade => "Marked for upgrade",
+            Self::MarkedForDowngrade => "Marked for downgrade",
+            Self::MarkedForRemove => "Marked for removal",
+            Self::Held => "Held",
         }
     }
 
@@ -138,7 +227,10 @@ impl PackageStatus {
     pub fn is_marked(&self) -> bool {
         matches!(
             self,
-            Self::MarkedForInstall | Self::MarkedForUpgrade | Self::MarkedForRemove
+            Self::MarkedForInstall
+                | Self::MarkedForUpgrade
+                | Self::MarkedForDowngrade
+                | Self::MarkedForRemove
         )
     }
 }
@@ -176,11 +268,12 @@ impl FilterCategory {
 }
 
 /// Displayed package info (extracted from rust-apt Package).
-/// The package is identified by `id` (PackageId). Name is derived, not stored separately.
+/// `id` is the handle for everything within one cache generation; `name`
+/// is what survives a reload (selection restore, intent carry-over).
 #[derive(Debug, Clone)]
 pub struct PackageInfo {
-    pub id: PackageId, // Stable handle for this package - the ONLY identifier
-    pub name: String,  // Full name including arch (e.g., "libfoo:i386") - for display/sort
+    pub id: PackageId,
+    pub name: String, // Full name including arch (e.g., "libfoo:i386")
     pub status: PackageStatus,
     pub section: String,
     pub installed_version: String,
@@ -192,32 +285,39 @@ pub struct PackageInfo {
 }
 
 impl PackageInfo {
-    pub fn size_str(bytes: u64) -> String {
-        if bytes == 0 {
-            return String::from("-");
-        }
-        const KB: u64 = 1024;
-        const MB: u64 = KB * 1024;
-        const GB: u64 = MB * 1024;
-
-        if bytes >= GB {
-            format!("{:.1} GB", bytes as f64 / GB as f64)
-        } else if bytes >= MB {
-            format!("{:.1} MB", bytes as f64 / MB as f64)
-        } else if bytes >= KB {
-            format!("{:.1} KB", bytes as f64 / KB as f64)
-        } else {
-            format!("{bytes} B")
-        }
-    }
-
     pub fn installed_size_str(&self) -> String {
-        Self::size_str(self.installed_size)
+        size_str(self.installed_size)
     }
 
     pub fn download_size_str(&self) -> String {
-        Self::size_str(self.download_size)
+        size_str(self.download_size)
     }
+}
+
+/// Format a byte count the way apt does: SI units (1 kB = 1000 B).
+pub fn size_str(bytes: u64) -> String {
+    if bytes == 0 {
+        return String::from("-");
+    }
+    const KB: u64 = 1000;
+    const MB: u64 = KB * 1000;
+    const GB: u64 = MB * 1000;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} kB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Format a signed byte delta, e.g. "+1.2 MB" / "-300 kB".
+pub fn size_change_str(delta: i64) -> String {
+    let sign = if delta < 0 { "-" } else { "+" };
+    format!("{sign}{}", size_str(delta.unsigned_abs()))
 }
 
 /// Which pane has focus
@@ -246,8 +346,7 @@ pub enum AppState {
     ShowingChangelog,   // Viewing package changelog
     ShowingSettings,    // Settings/preferences view
     ConfirmExit,        // Confirm exit with pending changes
-    Upgrading,
-    Done,
+    Done,               // Showing apt/dpkg output after applying changes
 }
 
 /// Sort options
@@ -279,12 +378,27 @@ impl SortBy {
     }
 }
 
+/// Sort configuration. The single owner of the default sort order.
+#[derive(Debug, Clone, Copy)]
+pub struct SortSettings {
+    pub sort_by: SortBy,
+    pub ascending: bool,
+}
+
+impl Default for SortSettings {
+    fn default() -> Self {
+        Self {
+            sort_by: SortBy::CandidateVersion,
+            ascending: true,
+        }
+    }
+}
+
 /// User settings (not persisted yet)
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub visible_columns: HashSet<Column>,
-    pub sort_by: SortBy,
-    pub sort_ascending: bool,
+    pub sort: SortSettings,
 }
 
 impl Default for Settings {
@@ -295,56 +409,24 @@ impl Default for Settings {
         visible_columns.insert(Column::CandidateVersion);
         Self {
             visible_columns,
-            sort_by: SortBy::CandidateVersion,
-            sort_ascending: true,
+            sort: SortSettings::default(),
         }
     }
 }
 
-/// Result of toggling a package
-#[derive(Debug)]
-pub enum ToggleResult {
-    /// Package was marked, with optional additional deps
-    Marked {
-        package: PackageId,
-        additional: Vec<PackageId>,
-    },
-    /// Package was unmarked, with cascade
-    Unmarked {
-        package: PackageId,
-        also_unmarked: Vec<PackageId>,
-    },
-    /// Toggle had no effect (e.g., dependency with untraceable origin)
-    NoChange { package: PackageId },
-}
-
-/// Preview of changes when marking or unmarking a package (or bulk selection).
-/// Displayed in a confirmation modal before the action is finalized.
+/// Preview of what a mark action did to the plan, shown in a confirmation
+/// modal. The action has already been applied; cancelling restores `undo`.
 #[derive(Debug, Clone)]
-pub enum MarkPreview {
-    /// Marking package(s) for install/upgrade
-    Mark {
-        package_name: String,
-        is_upgrade: bool,
-        additional_installs: Vec<String>,
-        additional_upgrades: Vec<String>,
-        additional_removes: Vec<String>,
-        download_size: u64,
-        /// PackageIds explicitly acted on in a bulk visual-mode operation.
-        /// Empty for single-package toggles. Used by cancel_mark() for reversal.
-        bulk_acted_ids: Vec<PackageId>,
-    },
-    /// Unmarking package(s) - reverting a previous mark
-    Unmark {
-        package_name: String,
-        /// Was the original package user-marked (vs a dependency)?
-        was_user_marked: bool,
-        /// Packages that were also unmarked as a cascade effect
-        also_unmarked: Vec<String>,
-        /// PackageIds explicitly acted on in a bulk visual-mode operation.
-        /// Empty for single-package toggles. Used by cancel_mark() for reversal.
-        bulk_acted_ids: Vec<PackageId>,
-    },
+pub struct MarkPreview {
+    pub headline: String,
+    /// Packages newly planned beyond the ones acted on, by display name
+    pub added: Vec<(String, ChangeAction)>,
+    /// Packages that left the plan beyond the ones acted on
+    pub dropped: Vec<String>,
+    /// Download size of everything the action newly planned
+    pub download_size: u64,
+    /// User intents as they were before the action
+    pub undo: IntentSnapshot,
 }
 
 /// Column configuration for the package table
@@ -423,8 +505,8 @@ pub struct ColumnWidths {
     pub candidate: u16,
 }
 
-impl ColumnWidths {
-    pub fn new() -> Self {
+impl Default for ColumnWidths {
+    fn default() -> Self {
         Self {
             name: 10,
             section: 7,
@@ -434,8 +516,129 @@ impl ColumnWidths {
     }
 }
 
-impl Default for ColumnWidths {
-    fn default() -> Self {
-        Self::new()
+/// Scroll position of a scrollable view. The renderer reports `viewport` and
+/// `content` each frame; key handlers move `offset` against those, so page
+/// size and the scroll limit come from what is actually on screen.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScrollView {
+    pub offset: usize,
+    pub viewport: usize,
+    pub content: usize,
+}
+
+impl ScrollView {
+    /// Largest offset that still fills the viewport
+    pub fn max_offset(&self) -> usize {
+        self.content.saturating_sub(self.viewport)
+    }
+
+    /// Rows moved by a page key
+    pub fn page(&self) -> usize {
+        self.viewport.max(1)
+    }
+
+    pub fn scroll_by(&mut self, delta: isize) {
+        self.offset = self
+            .offset
+            .saturating_add_signed(delta)
+            .min(self.max_offset());
+    }
+
+    pub fn page_by(&mut self, pages: isize) {
+        self.scroll_by(pages * self.page() as isize);
+    }
+
+    pub fn home(&mut self) {
+        self.offset = 0;
+    }
+
+    pub fn end(&mut self) {
+        self.offset = self.max_offset();
+    }
+
+    /// Record what the renderer measured and re-clamp.
+    pub fn measure(&mut self, viewport: usize, content: usize) {
+        self.viewport = viewport;
+        self.content = content;
+        self.offset = self.offset.min(self.max_offset());
+    }
+
+    /// Offset as ratatui's `Paragraph::scroll` wants it
+    pub fn offset_u16(&self) -> u16 {
+        u16::try_from(self.offset).unwrap_or(u16::MAX)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn size_str_uses_si_units() {
+        assert_eq!(size_str(0), "-");
+        assert_eq!(size_str(999), "999 B");
+        assert_eq!(size_str(1000), "1.0 kB");
+        assert_eq!(size_str(1_500_000), "1.5 MB");
+        assert_eq!(size_str(2_000_000_000), "2.0 GB");
+    }
+
+    #[test]
+    fn size_change_str_signs() {
+        assert_eq!(size_change_str(1000), "+1.0 kB");
+        assert_eq!(size_change_str(-1000), "-1.0 kB");
+        assert_eq!(size_change_str(i64::MIN), "-9223372036.9 GB");
+    }
+
+    #[test]
+    fn plan_problems_summary_prefers_errors() {
+        let p = PlanProblems {
+            errors: vec!["broken".into(), "also broken".into()],
+            warnings: vec!["meh".into()],
+        };
+        assert_eq!(p.summary().unwrap(), "broken; and 1 more error(s)");
+        let w = PlanProblems {
+            errors: vec![],
+            warnings: vec!["meh".into()],
+        };
+        assert_eq!(w.summary().unwrap(), "meh");
+        assert!(PlanProblems::default().summary().is_none());
+    }
+
+    #[test]
+    fn scroll_view_clamps_to_content() {
+        let mut s = ScrollView::default();
+        s.measure(10, 25);
+        s.page_by(1);
+        assert_eq!(s.offset, 10);
+        s.page_by(1);
+        assert_eq!(s.offset, 15);
+        s.scroll_by(-100);
+        assert_eq!(s.offset, 0);
+        s.end();
+        assert_eq!(s.offset, 15);
+        s.measure(10, 12);
+        assert_eq!(s.offset, 2);
+    }
+
+    #[test]
+    fn scroll_view_short_content_does_not_scroll() {
+        let mut s = ScrollView::default();
+        s.measure(10, 3);
+        s.end();
+        assert_eq!(s.offset, 0);
+    }
+
+    #[test]
+    fn change_action_classification() {
+        assert_eq!(
+            ChangeAction::from_marked(Marked::Downgrade),
+            Some(ChangeAction::Downgrade)
+        );
+        assert_eq!(
+            ChangeAction::from_marked(Marked::Purge),
+            Some(ChangeAction::Remove)
+        );
+        assert_eq!(ChangeAction::from_marked(Marked::Held), None);
+        assert!(!ChangeAction::Remove.downloads());
     }
 }

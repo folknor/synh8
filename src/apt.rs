@@ -8,60 +8,74 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use color_eyre::Result;
+use color_eyre::eyre::eyre;
 use rust_apt::cache::{Cache, PackageSort};
 use rust_apt::error::AptErrors;
 use rust_apt::progress::{AcquireProgress, InstallProgress};
-use rust_apt::{Package, Version};
+use rust_apt::{DepType, Package, Version};
 
 use crate::types::*;
 
-/// Manages APT cache interactions with stable PackageId handles.
+/// Manages APT cache interactions with PackageId handles.
 /// Each unique package (including multi-arch variants) gets its own PackageId.
+/// Ids are renumbered by every `reload()`.
 pub struct AptCache {
     cache: Cache,
-    /// Map from package full name (e.g., "libfoo:amd64") to stable PackageId
-    pub(crate) fullname_to_id: HashMap<String, PackageId>,
+    /// Map from package full name (e.g., "libfoo:amd64") to PackageId
+    fullname_to_id: HashMap<String, PackageId>,
     /// Reverse map: PackageId -> full name
     id_to_fullname: Vec<String>,
     /// Native architecture (e.g., "amd64")
     native_arch: String,
     /// Cached suffix for display_name stripping (e.g., ":amd64")
     native_arch_suffix: String,
+    /// Incremented by every successful `reload()`
+    generation: u64,
 }
 
 impl AptCache {
-    /// Create a new AptCache with a fresh APT cache, pre-populating all PackageIds.
-    /// Each multi-arch variant gets its own unique PackageId.
+    /// Open the APT cache and number every package.
     pub fn new() -> Result<Self> {
         let cache = Cache::new::<&str>(&[])?;
-
-        // Get native architecture from dpkg
-        let native_arch = std::process::Command::new("dpkg")
-            .arg("--print-architecture")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|_| "amd64".to_string());
-        let mut fullname_to_id = HashMap::new();
-        let mut id_to_fullname = Vec::new();
-
-        // Pre-populate all package IDs at creation time using FULL names
-        // This properly handles multi-arch: libfoo:amd64 and libfoo:i386 get different IDs
-        for pkg in cache.packages(&PackageSort::default()) {
-            let fullname = pkg.fullname(false);
-            let id = PackageId(id_to_fullname.len() as u32);
-            id_to_fullname.push(fullname.clone());
-            fullname_to_id.insert(fullname, id);
-        }
-
+        // Cache::new initialises the APT configuration, so this is populated.
+        let native_arch = rust_apt::config::Config::new().find("APT::Architecture", "");
         let native_arch_suffix = format!(":{native_arch}");
-
-        Ok(Self {
+        let mut apt = Self {
             cache,
-            fullname_to_id,
-            id_to_fullname,
+            fullname_to_id: HashMap::new(),
+            id_to_fullname: Vec::new(),
             native_arch,
             native_arch_suffix,
-        })
+            generation: 0,
+        };
+        apt.number_packages();
+        Ok(apt)
+    }
+
+    /// Assign ids using FULL names, so libfoo:amd64 and libfoo:i386 differ.
+    fn number_packages(&mut self) {
+        self.fullname_to_id.clear();
+        self.id_to_fullname.clear();
+        for pkg in self.cache.packages(&PackageSort::default()) {
+            let fullname = pkg.fullname(false);
+            let id = PackageId(self.id_to_fullname.len() as u32);
+            self.id_to_fullname.push(fullname.clone());
+            self.fullname_to_id.insert(fullname, id);
+        }
+    }
+
+    /// Re-open the cache from disk. Starts a new id generation: every
+    /// PackageId issued before this call is invalid afterwards.
+    pub fn reload(&mut self) -> Result<()> {
+        self.cache = Cache::new::<&str>(&[])?;
+        self.number_packages();
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// Id generation: changes whenever ids are renumbered
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Get the native architecture (e.g., "amd64")
@@ -78,25 +92,27 @@ impl AptCache {
             .unwrap_or(fullname)
     }
 
+    /// Display name for a PackageId, with a visible placeholder for ids
+    /// from another cache generation.
+    pub fn display_name_of(&self, id: PackageId) -> String {
+        self.fullname_of(id).map_or_else(
+            || format!("(unknown:{})", id.index()),
+            |n| self.display_name(n).to_string(),
+        )
+    }
+
     // ========================================================================
     // PackageId management
     // ========================================================================
 
-    /// Get or create a stable PackageId for a package full name (e.g., "libfoo:amd64")
-    pub fn id_for(&mut self, fullname: &str) -> PackageId {
-        if let Some(&id) = self.fullname_to_id.get(fullname) {
-            id
-        } else {
-            let id = PackageId(self.id_to_fullname.len() as u32);
-            self.id_to_fullname.push(fullname.to_string());
-            self.fullname_to_id.insert(fullname.to_string(), id);
-            id
-        }
-    }
-
     /// Get the PackageId for a full name (returns None if not known)
     pub fn get_id(&self, fullname: &str) -> Option<PackageId> {
         self.fullname_to_id.get(fullname).copied()
+    }
+
+    /// Get the PackageId of a package from this cache
+    pub fn id_of(&self, pkg: &Package) -> Option<PackageId> {
+        self.get_id(&pkg.fullname(false))
     }
 
     /// Get the full name for a PackageId
@@ -127,71 +143,57 @@ impl AptCache {
     }
 
     // ========================================================================
-    // Marking operations (low-level, crate-only)
-    // These are only accessible from core.rs via SharedState.
-    // External code must use ManagerState methods which enforce the typestate.
+    // Marking operations. Called only by core.rs's plan(), which derives
+    // every APT mark from user intent.
     // ========================================================================
 
-    /// Mark a package for install/upgrade (by name)
-    pub(crate) fn mark_install(&self, name: &str) {
-        if let Some(pkg) = self.cache.get(name) {
+    /// Mark a package for install/upgrade, pulling in its dependencies
+    pub(crate) fn mark_install(&self, id: PackageId) {
+        if let Some(pkg) = self.get_by_id(id) {
             pkg.mark_install(true, true);
-            // Note: We don't call protect() because we manage state through
-            // user_intent in core.rs, not through APT's protection mechanism.
-            // This allows clear_all_marks() to properly reset the cache.
         }
     }
 
-    /// Mark a package for install/upgrade (by id)
-    pub(crate) fn mark_install_id(&self, id: PackageId) {
-        if let Some(name) = self.fullname_of(id) {
-            self.mark_install(name);
-        }
-    }
-
-    /// Mark a package for removal (by name)
-    pub(crate) fn mark_delete(&self, name: &str) {
-        if let Some(pkg) = self.cache.get(name) {
+    /// Mark a package for removal (configuration files are kept)
+    pub(crate) fn mark_delete(&self, id: PackageId) {
+        if let Some(pkg) = self.get_by_id(id) {
             pkg.mark_delete(false);
-            // Note: No protect() - we manage state through user_intent
         }
     }
 
-    /// Mark a package for removal (by id)
-    pub(crate) fn mark_delete_id(&self, id: PackageId) {
-        if let Some(name) = self.fullname_of(id) {
-            self.mark_delete(name);
-        }
-    }
-
-    /// Mark a package to keep current version (unmark)
-    pub(crate) fn mark_keep(&self, name: &str) {
-        if let Some(pkg) = self.cache.get(name) {
+    /// Mark a package to stay in its current state
+    pub(crate) fn mark_keep(&self, id: PackageId) {
+        if let Some(pkg) = self.get_by_id(id) {
             pkg.mark_keep();
         }
     }
 
-    /// Mark a package to keep (by id)
-    pub(crate) fn mark_keep_id(&self, id: PackageId) {
-        if let Some(name) = self.fullname_of(id) {
-            self.mark_keep(name);
+    /// Forbid the resolver from changing this package's mark. Protection
+    /// lives in the resolver, not the depcache, so `clear_all_marks()` does
+    /// not reset it; `unprotect()` does.
+    pub(crate) fn protect(&self, id: PackageId) {
+        if let Some(pkg) = self.get_by_id(id) {
+            pkg.protect();
         }
     }
 
-    /// Clear all marks on all packages.
-    /// Returns an error if the APT depcache cannot be reset, which would leave
-    /// stale marks that corrupt subsequent planning operations.
+    /// Undo `protect()`
+    pub(crate) fn unprotect(&self, id: PackageId) {
+        if let Some(pkg) = self.get_by_id(id) {
+            self.cache.resolver().clear(&pkg);
+        }
+    }
+
+    /// Clear all marks on all packages in a single depcache re-init.
     pub(crate) fn clear_all_marks(&self) -> Result<(), String> {
-        // Use depcache init to bulk-reset all marks in a single C++ call,
-        // instead of iterating get_changes() and calling mark_keep() per package.
         self.cache
             .depcache()
             .clear_marked()
-            .map_err(|e| format!("clear_marked() failed: {e}"))
+            .map_err(|e| format!("Failed to reset APT marks: {e}"))
     }
 
     /// Resolve dependencies
-    pub(crate) fn resolve(&mut self) -> Result<(), AptErrors> {
+    pub(crate) fn resolve(&self) -> Result<(), AptErrors> {
         self.cache.resolve(true)
     }
 
@@ -205,8 +207,6 @@ impl AptCache {
     pub fn extract_package_info(&self, pkg: &Package) -> Option<PackageInfo> {
         let candidate = pkg.candidate()?;
 
-        // Return BASE status only - ignore APT marks
-        // core.rs will overlay user_intent and dependency info for display
         let status = if pkg.is_installed() {
             if pkg.is_upgradable() {
                 PackageStatus::Upgradable
@@ -223,7 +223,6 @@ impl AptCache {
             .unwrap_or_default();
 
         let fullname = pkg.fullname(false);
-        // Use get_id with FULL name since IDs are mapped to full names
         let id = self.get_id(&fullname)?;
 
         Some(PackageInfo {
@@ -244,100 +243,136 @@ impl AptCache {
     // Dependency queries
     // ========================================================================
 
-    /// Get forward dependencies for a package
-    pub fn get_dependencies(&self, name: &str) -> Vec<(String, String)> {
+    /// Forward dependencies of a package's candidate version
+    pub fn get_dependencies(&self, fullname: &str) -> Vec<(DepType, String)> {
         let mut deps = Vec::new();
-
-        let pkg = match self.cache.get(name) {
-            Some(p) => p,
-            None => return deps,
-        };
-
-        if let Some(version) = pkg.candidate()
+        if let Some(pkg) = self.cache.get(fullname)
+            && let Some(version) = pkg.candidate()
             && let Some(dependencies) = version.dependencies()
         {
             for dep in dependencies {
-                let dep_type = dep.dep_type().to_string();
                 for base_dep in dep.iter() {
-                    deps.push((dep_type.clone(), base_dep.name().to_string()));
+                    deps.push((base_dep.dep_type(), base_dep.name().to_string()));
                 }
             }
         }
-
-        deps.sort_by(|a, b| {
-            dep_type_order(&a.0)
-                .cmp(&dep_type_order(&b.0))
-                .then_with(|| a.1.cmp(&b.1))
-        });
-
+        sort_deps(&mut deps);
         deps
     }
 
-    /// Get reverse dependencies for a package
-    pub fn get_reverse_dependencies(&self, name: &str) -> Vec<(String, String)> {
+    /// Reverse dependencies of a package
+    pub fn get_reverse_dependencies(&self, fullname: &str) -> Vec<(DepType, String)> {
         let mut rdeps = Vec::new();
-
-        let pkg = match self.cache.get(name) {
-            Some(p) => p,
-            None => return rdeps,
-        };
-
-        let rdep_map = pkg.rdepends();
-        for (dep_type, deps) in rdep_map {
-            let type_str = format!("{dep_type:?}");
-            for dep in deps {
-                for base_dep in dep.iter() {
-                    rdeps.push((type_str.clone(), base_dep.name().to_string()));
+        if let Some(pkg) = self.cache.get(fullname) {
+            for (dep_type, deps) in pkg.rdepends() {
+                for dep in deps {
+                    for base_dep in dep.iter() {
+                        rdeps.push((dep_type.clone(), base_dep.name().to_string()));
+                    }
                 }
             }
         }
-
-        rdeps.sort_by(|a, b| {
-            dep_type_order(&a.0)
-                .cmp(&dep_type_order(&b.0))
-                .then_with(|| a.1.cmp(&b.1))
-        });
-
+        sort_deps(&mut rdeps);
         rdeps
     }
 
-    // ========================================================================
-    // Statistics
-    // ========================================================================
+    /// Ids of every package that can satisfy a hard or recommended
+    /// dependency of `id`'s candidate version (or installed version, when
+    /// `installed` is set). Virtual packages resolve to their providers.
+    pub(crate) fn dependency_ids(&self, id: PackageId, installed: bool) -> Vec<PackageId> {
+        let Some(pkg) = self.get_by_id(id) else {
+            return Vec::new();
+        };
+        let version = if installed {
+            pkg.installed()
+        } else {
+            pkg.candidate()
+        };
+        let Some(deps) = version.as_ref().and_then(Version::dependencies) else {
+            return Vec::new();
+        };
+        let mut ids = Vec::new();
+        for dep in deps {
+            if !matches!(
+                dep.dep_type(),
+                DepType::Depends | DepType::PreDepends | DepType::Recommends
+            ) {
+                continue;
+            }
+            for base_dep in dep.iter() {
+                for target in base_dep.all_targets() {
+                    if let Some(target_id) = self.id_of(&target.parent()) {
+                        ids.push(target_id);
+                    }
+                }
+            }
+        }
+        ids
+    }
 
     // ========================================================================
     // Cache lifecycle
     // ========================================================================
 
-    /// Full refresh - reload cache from disk
-    pub fn refresh(&mut self) -> Result<()> {
-        self.cache = Cache::new::<&str>(&[])?;
-        // Note: We keep the id mappings - they're still valid names
-        Ok(())
-    }
-
-    /// Commit changes using caller-provided progress implementations
-    pub(crate) fn commit_with_progress(
+    /// Download and install the marked changes. Whatever happens, the cache
+    /// is reloaded afterwards so it reflects the system as it now is; if the
+    /// reload itself fails the pre-commit cache stays in place (stale but
+    /// usable) and the error is reported.
+    pub(crate) fn commit(
         &mut self,
         acquire_progress: &mut AcquireProgress,
         install_progress: &mut InstallProgress,
     ) -> Result<()> {
         ensure_archive_dirs()?;
-        let cache = std::mem::replace(&mut self.cache, Cache::new::<&str>(&[])?);
-        cache.commit(acquire_progress, install_progress)?;
-        Ok(())
+        // commit() consumes the cache, so a stand-in is needed.
+        let marked = std::mem::replace(&mut self.cache, Cache::new::<&str>(&[])?);
+        let result = marked
+            .commit(acquire_progress, install_progress)
+            .map_err(|e| eyre!("{}", format_apt_errors(&e)));
+        combine(result, self.reload())
     }
 
-    /// Run `apt update` (refresh package lists) with caller-provided progress
-    pub(crate) fn update_with_progress(
-        &mut self,
-        acquire_progress: &mut AcquireProgress,
-    ) -> Result<()> {
-        let cache = std::mem::replace(&mut self.cache, Cache::new::<&str>(&[])?);
-        cache.update(acquire_progress)?;
-        // Reload cache after update to pick up new package lists
-        self.cache = Cache::new::<&str>(&[])?;
-        Ok(())
+    /// Run `apt update` (refresh package lists), then reload the cache.
+    /// Like `commit()`, always leaves a usable cache behind.
+    pub(crate) fn update(&mut self, acquire_progress: &mut AcquireProgress) -> Result<()> {
+        let old = std::mem::replace(&mut self.cache, Cache::new::<&str>(&[])?);
+        let result = old
+            .update(acquire_progress)
+            .map_err(|e| eyre!("{}", format_apt_errors(&e)));
+        combine(result, self.reload())
+    }
+}
+
+/// Merge an operation result with the reload that follows it, keeping both
+/// errors if both failed.
+fn combine(op: Result<()>, reload: Result<()>) -> Result<()> {
+    match (op, reload) {
+        (Ok(()), r) => r,
+        (Err(e), Ok(())) => Err(e),
+        (Err(e), Err(r)) => Err(e.wrap_err(format!(
+            "additionally, reloading the package cache failed: {r}"
+        ))),
+    }
+}
+
+/// Fetch a package's changelog with `apt changelog`.
+pub fn fetch_changelog(display_name: &str) -> Result<Vec<String>> {
+    let output = std::process::Command::new("apt")
+        .args(["changelog", display_name])
+        .output()
+        .map_err(|e| eyre!("Failed to run apt changelog: {e}"))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(eyre!("apt changelog {display_name}: {}", err.trim()));
+    }
+    let lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(std::string::ToString::to_string)
+        .collect();
+    if lines.is_empty() {
+        Ok(vec!["No changelog available.".to_string()])
+    } else {
+        Ok(lines)
     }
 }
 
@@ -370,45 +405,46 @@ fn ensure_archive_dirs() -> Result<()> {
     Ok(())
 }
 
-/// Helper function to order dependency types by priority
-fn dep_type_order(t: &str) -> u8 {
+/// Order dependency types by importance, then by name
+fn sort_deps(deps: &mut [(DepType, String)]) {
+    deps.sort_by(|a, b| {
+        dep_type_order(&a.0)
+            .cmp(&dep_type_order(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+}
+
+fn dep_type_order(t: &DepType) -> u8 {
     match t {
-        "PreDepends" => 0,
-        "Depends" => 1,
-        "Recommends" => 2,
-        "Suggests" => 3,
-        "Enhances" => 4,
-        _ => 5,
+        DepType::PreDepends => 0,
+        DepType::Depends => 1,
+        DepType::Recommends => 2,
+        DepType::Suggests => 3,
+        DepType::Enhances => 4,
+        DepType::Conflicts | DepType::DpkgBreaks | DepType::Replaces | DepType::Obsoletes => 5,
     }
 }
 
-/// Format AptErrors into a user-friendly string with specific conflict details.
-/// Errors take priority over warnings: a real error is always the headline,
-/// and warnings only surface when APT produced no errors at all.
-pub fn format_apt_errors(errors: &AptErrors) -> String {
-    let (mut errs, mut warns): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
-
+/// Split AptErrors into errors and warnings
+pub fn plan_problems(errors: &AptErrors) -> PlanProblems {
+    let mut problems = PlanProblems::default();
     for error in errors.iter() {
         let msg = error.msg.trim();
         if msg.is_empty() {
             continue;
         }
         if error.is_error {
-            errs.push(msg);
+            problems.errors.push(msg.to_string());
         } else {
-            warns.push(msg);
+            problems.warnings.push(msg.to_string());
         }
     }
+    problems
+}
 
-    let (messages, label) = if errs.is_empty() {
-        (warns, "warning")
-    } else {
-        (errs, "issue")
-    };
-
-    match messages.len() {
-        0 => "Dependency resolution failed (no specific details available)".to_string(),
-        1 => messages[0].to_string(),
-        n => format!("{}; and {} more {}(s)", messages[0], n - 1, label),
-    }
+/// Format AptErrors into a one-line, user-friendly string.
+pub fn format_apt_errors(errors: &AptErrors) -> String {
+    plan_problems(errors)
+        .summary()
+        .unwrap_or_else(|| "APT reported a failure without details".to_string())
 }
