@@ -1,0 +1,154 @@
+# synh8
+
+Synaptic-inspired TUI for managing APT packages on Debian/Ubuntu. Rust + ratatui + rust-apt.
+
+## Build
+
+Requires `libapt-pkg-dev`. Linux-only. Use `brokkr` (not raw `cargo`).
+
+```bash
+sudo apt install libapt-pkg-dev
+brokkr check       # gremlins + clippy + tests. Replaces build/test/clippy
+brokkr fmt         # format
+```
+
+Must run as root:
+```bash
+sudo ./target/release/synh8
+```
+
+## Feature flags
+
+- `hotpath` - function-level timing profiling (zero overhead when disabled)
+- `hotpath-alloc` - allocation tracking
+
+```bash
+brokkr check --features hotpath
+sudo ./target/release/synh8
+# Report prints to stderr on exit
+```
+
+Instrumented functions: `core::plan`, `core::rebuild_list`, `core::toggle`,
+`ui::ui`, `ui::render_package_table`, `app::refresh_ui_state`,
+`app::restore_selection`, `app::update_cached_deps`.
+
+## Architecture
+
+### Source layout
+
+- `main.rs` - terminal setup and event loop
+- `app.rs` - TUI application state and key handling, wraps `ManagerState`
+- `ui.rs` - ratatui rendering (windowed table rendering for large lists)
+- `core.rs` - typestate package manager, planning, filter caching
+- `keymap.rs` - keybinding registry (dispatch, help bar, `docs/keybindings.md`)
+- `types.rs` - enums, structs, type definitions
+- `apt.rs` - thin wrapper around rust-apt with `PackageId` handles
+- `search.rs` - SQLite FTS5 full-text search across package names
+- `progress.rs` - progress modal for downloads/installs, stdout/stderr capture
+- `version.rs` - Debian version comparison (pure Rust, used for sorting)
+
+### Typestate pattern (core.rs)
+
+`PackageManager<S>` uses compile-time states:
+
+- **`Clean`** - no intents, no APT marks. `edit()` → Dirty.
+- **`Dirty`** - intents edited, APT marks not derived yet. `plan()` → Planned, `reset()` → Clean.
+- **`Planned`** - dependencies resolved, changeset computed. `modify()` → Dirty, `commit()` → Clean.
+
+`ManagerState` holds whichever is current for the TUI. Its `edit_intents()`
+always re-plans (or resets to Clean when no intents remain), so outside
+core.rs the state is only ever Clean or Planned. `Transitioning` is a
+placeholder that exists only inside `ManagerState::transition()`; every
+transition is infallible.
+
+### User intent model
+
+`user_intent: HashMap<PackageId, UserIntent>` (Install / Remove / Hold) is the single source of truth for what the user wants. APT marks are derived from intent via `plan()`, never set directly. `plan()` protects every intent in the APT resolver (as apt-get protects the packages on its command line), so the resolver reports an error instead of dropping a mark; plans with resolver errors cannot be committed. Display status is overlaid on base statuses from user_intent, then planned changes.
+
+Mark actions in the UI snapshot intents and planned ids first, then diff the new plan against them (`diff_since`); cancel restores the snapshot.
+
+### Cache generations
+
+`PackageId`s are numbered per cache generation. `AptCache::reload()` (after every commit and `apt update`) renumbers everything; core.rs carries intents across by full name and clears the filter cache and search index.
+
+### Filter caching
+
+`rebuild_list()` results are memoized per `FilterCategory` with base statuses (before the overlay). Cache entries persist across switches and are cloned on restore with a fresh overlay. MarkedChanges is never cached: it is built from intents plus the plan. Warmed incrementally during idle event-loop cycles (`App::warm_next`). Cleared on reload.
+
+### Windowed rendering
+
+`render_package_table()` only builds `Row`/`Cell` objects for the visible ~35 rows, using a temporary slice-relative `TableState`. The app-level `TableState` stays absolute. Scrollbar uses the original absolute state.
+
+## Conventions
+
+- Strict clippy lints: `unwrap_used` is NOT denied (unlike pbfhogg), but several style and correctness lints are deny-level. See `[lints.clippy]` in Cargo.toml.
+- Unit tests cover the pure logic (version order, search query escaping, sizes, scrolling, status overlay, keymap). Anything touching the APT cache or the TUI is tested manually (requires root + apt packages).
+- Keybindings live only in `src/keymap.rs`. After changing them, regenerate `docs/keybindings.md` with `SYNH8_BLESS=1 brokkr check`; a test fails if it drifts.
+- Single-threaded - no async, no threading. rust-apt types are not Send.
+- `PackageId` is an opaque handle valid for one cache generation. Maps to full package names (including arch, e.g., "libfoo:amd64").
+
+## Key dependencies
+
+- **rust-apt 0.11** - APT cache bindings (main FFI dependency)
+- **ratatui 0.30** - TUI rendering (`unstable-rendered-line-info` for scroll limits)
+- **crossterm 0.29** - terminal I/O
+- **rusqlite 0.40 (bundled)** - SQLite FTS5 search index
+- **hotpath 0.26** - function-level profiling
+
+## Performance notes
+
+The dominant cost in this codebase is rust-apt FFI property extraction when iterating large package sets (~81k total packages). Key findings:
+
+- `cache.resolve()` (dependency resolver): ~45ms. Not the bottleneck.
+- Per-package FFI extraction: ~150ms for 81k packages. Cannot be reduced by Rust-side restructuring.
+- `depcache().clear_marked()` replaced per-package mark_keep loop: 401ms → 114ms.
+- Filter cache eliminates FFI on repeated filter switches: ~25ms cache hit vs ~450ms cold miss.
+- Windowed rendering: ~300µs per frame regardless of list size.
+- A single mark (re-plan including resolver protection): ~200ms. Cold All-list rebuild including the version sort: ~450-550ms.
+
+## Rules
+
+### General rules
+
+- Don't use gremlins! Em-dash, en-dash, strange quotes, whatever - they're all verboten.
+- Don't remind the user of the rules. They wrote them, so they know them.
+- The user can exempt you from any rule at any time.
+
+### Bash rules
+
+- Never read or write from `/tmp`. All data lives in the project.
+- Never run raw `cargo`, `curl`, `pkill`. Use `brokkr`.
+
+## Document folders
+
+The standing layout, across every project. Three live folders plus one retired,
+split by durability first, subject second.
+
+| Folder | Contents | Rule |
+|---|---|---|
+| `reference/` | Durable in-repo reference for anyone working on or with the code - how the thing is built and why: `architecture.md`, `technical-implementation-spec.md`, `performance.md` (the durable record of measured numbers over time), invariants, protocol contracts | Citable from source as a source of truth. What it says must be true. |
+| `docs/` | Durable in-repo documentation of how the thing is used - guides, CLI reference, the consumer-facing API surface. Sometimes exposed as a hand-edited VitePress gh-pages site | Same must-be-true rule. |
+| `notes/` | Transient - work items (`todo.md`), future plans, hypotheticals, bug reports, research, analysis. Things that will die | No truth guarantee. Nothing durable cites it. |
+| `plans/` | Retired | Plan documents are transient: they go in `notes/`. |
+
+`reference/` and `docs/` are both durable and both binding. The difference is
+subject, not audience: `reference/` covers how the thing is built and why - what
+you need in order to change it safely - while `docs/` covers how it is used. A
+developer or library consumer reads both. Where a project publishes a site,
+`docs/` is what gets published; the folder means the same thing either way.
+`notes/` is neither durable nor binding, which is the whole point of keeping it
+separate: a document that may be wrong must not sit where a document that must
+be right is expected.
+
+The dependency direction is therefore one-way. `notes/` may cite `docs/` and
+`reference/`; nothing durable may cite `notes/` - not a code comment, not
+`docs/`, not `reference/`. A code comment must carry its full context, because
+it outlives the note.
+
+**Root-level convention files are exempt.** `AGENTS.md`, `CLAUDE.md`,
+`README.md`, `LICENSE`, `CHANGELOG.md` and their kin are found by tooling and by
+convention at the repository root, and stay there. These folders govern
+documents we chose where to put, not files whose location is dictated.
+
+In `notes/`, `docs/` and `reference/` alike, avoid citing source line numbers -
+they drift fast.
