@@ -1,4 +1,27 @@
 project = "synh8"
 
+[bin]
+default = "synh8"
+
 [test]
 debug = true
+
+# Headless core workload (src/bin/synh8-bench.rs). Read-only against APT, so
+# it runs without root. `brokkr bench --hotpath core` profiles it.
+[bench.core]
+target = "synh8-bench"
+hotpath_features = ["hotpath"]
+params.package = { help = "full package name to mark for install (default: first not-installed package)" }
+script = """
+function bench(params, keys)
+    local r
+    if params.package then
+        r = binary_with({ hotpath = "core" }, params.package):ok()
+    else
+        r = binary_with({ hotpath = "core" }):ok()
+    end
+    local phases = json.decode(r.stdout)
+    for name, v in pairs(phases) do
+        record[name] = v
+    end
+end"""

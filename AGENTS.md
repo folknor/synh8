@@ -22,11 +22,21 @@ sudo ./target/release/synh8
 - `hotpath` - function-level timing profiling (zero overhead when disabled)
 - `hotpath-alloc` - allocation tracking
 
+Benchmarks are script benches in `brokkr.toml` (`brokkr man bench-config`).
+`[bench.core]` runs `src/bin/synh8-bench.rs`, a headless, read-only workload
+(open, cold and warm filter switches, mark/unmark, search index and query) that
+needs no root. It prints per-phase milliseconds as JSON, stored as the run's
+record.
+
 ```bash
-brokkr check --features hotpath
-sudo ./target/release/synh8
-# Report prints to stderr on exit
+brokkr bench core                       # timing run
+brokkr bench --hotpath core             # instrumented, captures the hotpath report
+brokkr bench core --package NAME:ARCH   # mark a specific not-installed package
+brokkr results <uuid>                   # record + hotpath table
 ```
+
+For profiling the interactive TUI itself, build with `--features hotpath` and
+run `sudo ./target/release/synh8`; the report prints to stderr on exit.
 
 Instrumented functions: `core::plan`, `core::rebuild_list`, `core::toggle`,
 `ui::ui`, `ui::render_package_table`, `app::refresh_ui_state`,
