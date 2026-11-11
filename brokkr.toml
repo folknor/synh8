@@ -11,7 +11,7 @@ debug = true
 [bench.core]
 target = "synh8-bench"
 hotpath_features = ["hotpath"]
-params.package = { help = "full package name to mark for install (default: first not-installed package)" }
+params.package = { free = true, help = "full package name to mark for install (default: first not-installed package)" }
 script = """
 function bench(params, keys)
     local r
